@@ -1,0 +1,10 @@
+# macOS metadata
+.DS_Store
+
+# Go build and test artifacts
+bin/
+*.test
+coverage.out
+
+# Demo output
+testfile/*/

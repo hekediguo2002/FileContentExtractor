@@ -10,9 +10,9 @@ import (
 	"strings"
 	"unicode/utf16"
 
-	"filecontentextractor/internal/officeart"
-	"filecontentextractor/internal/ole"
-	"filecontentextractor/model"
+	"github.com/hekediguo2002/FileContentExtractor/internal/officeart"
+	"github.com/hekediguo2002/FileContentExtractor/internal/ole"
+	"github.com/hekediguo2002/FileContentExtractor/model"
 )
 
 type record struct {

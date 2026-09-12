@@ -19,7 +19,7 @@ import (
 	"strings"
 	"time"
 
-	fce "filecontentextractor"
+	fce "github.com/hekediguo2002/FileContentExtractor"
 )
 
 var errUnsupported = fmt.Errorf("unsupported")

@@ -17,7 +17,7 @@ import (
 	"strings"
 	"unicode/utf16"
 
-	"filecontentextractor/model"
+	"github.com/hekediguo2002/FileContentExtractor/model"
 )
 
 type object struct {

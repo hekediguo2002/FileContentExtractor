@@ -11,7 +11,7 @@ import (
 	"strconv"
 	"strings"
 
-	"filecontentextractor/model"
+	"github.com/hekediguo2002/FileContentExtractor/model"
 )
 
 const mmToPt = 72.0 / 25.4

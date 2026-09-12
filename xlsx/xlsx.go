@@ -16,7 +16,7 @@ import (
 	"strconv"
 	"strings"
 
-	"filecontentextractor/model"
+	"github.com/hekediguo2002/FileContentExtractor/model"
 )
 
 type node struct {

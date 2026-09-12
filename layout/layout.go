@@ -5,7 +5,7 @@ import (
 	"strings"
 	"unicode"
 
-	"filecontentextractor/model"
+	"github.com/hekediguo2002/FileContentExtractor/model"
 )
 
 type Paragraph struct {

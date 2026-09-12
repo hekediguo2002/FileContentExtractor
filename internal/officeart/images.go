@@ -8,7 +8,7 @@ import (
 	_ "image/jpeg"
 	_ "image/png"
 
-	"filecontentextractor/model"
+	"github.com/hekediguo2002/FileContentExtractor/model"
 )
 
 func Images(data []byte) []model.Image {

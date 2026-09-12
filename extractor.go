@@ -5,16 +5,16 @@ import (
 	"path/filepath"
 	"strings"
 
-	"filecontentextractor/doc"
-	"filecontentextractor/docx"
-	"filecontentextractor/model"
-	"filecontentextractor/ofd"
-	"filecontentextractor/pdf"
-	"filecontentextractor/ppt"
-	"filecontentextractor/pptx"
-	"filecontentextractor/rtf"
-	"filecontentextractor/xls"
-	"filecontentextractor/xlsx"
+	"github.com/hekediguo2002/FileContentExtractor/doc"
+	"github.com/hekediguo2002/FileContentExtractor/docx"
+	"github.com/hekediguo2002/FileContentExtractor/model"
+	"github.com/hekediguo2002/FileContentExtractor/ofd"
+	"github.com/hekediguo2002/FileContentExtractor/pdf"
+	"github.com/hekediguo2002/FileContentExtractor/ppt"
+	"github.com/hekediguo2002/FileContentExtractor/pptx"
+	"github.com/hekediguo2002/FileContentExtractor/rtf"
+	"github.com/hekediguo2002/FileContentExtractor/xls"
+	"github.com/hekediguo2002/FileContentExtractor/xlsx"
 )
 
 type Rect = model.Rect

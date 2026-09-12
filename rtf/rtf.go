@@ -9,8 +9,8 @@ import (
 	"strconv"
 	"strings"
 
-	"filecontentextractor/layout"
-	"filecontentextractor/model"
+	"github.com/hekediguo2002/FileContentExtractor/layout"
+	"github.com/hekediguo2002/FileContentExtractor/model"
 )
 
 var tokenRe = regexp.MustCompile(`\\([A-Za-z]+)(-?\d+)? ?|\\'([0-9A-Fa-f]{2})|\\([^A-Za-z])|([{}])|([^\\{}]+)`)

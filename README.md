@@ -29,7 +29,7 @@ import (
     "fmt"
     "log"
 
-    fce "filecontentextractor"
+    fce "github.com/hekediguo2002/FileContentExtractor"
 )
 
 func main() {

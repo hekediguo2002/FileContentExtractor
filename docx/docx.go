@@ -14,8 +14,8 @@ import (
 	"strconv"
 	"strings"
 
-	"filecontentextractor/layout"
-	root "filecontentextractor/model"
+	"github.com/hekediguo2002/FileContentExtractor/layout"
+	root "github.com/hekediguo2002/FileContentExtractor/model"
 )
 
 type xmlNode struct {

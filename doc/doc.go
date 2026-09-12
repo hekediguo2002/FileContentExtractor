@@ -10,8 +10,8 @@ import (
 	"strings"
 	"unicode/utf16"
 
-	"filecontentextractor/layout"
-	"filecontentextractor/model"
+	"github.com/hekediguo2002/FileContentExtractor/layout"
+	"github.com/hekediguo2002/FileContentExtractor/model"
 )
 
 func ParseFile(name string) (*model.Document, error) {

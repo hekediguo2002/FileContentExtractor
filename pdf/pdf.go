@@ -545,58 +545,64 @@ func pageFonts(dict []byte, objs map[int]object) map[string]fontInfo {
 }
 func parseCMap(data []byte) (map[string]string, int) {
 	out := map[string]string{}
-	mode := ""
 	width := 0
 	pair := regexp.MustCompile(`<([0-9A-Fa-f]+)>\s*<([0-9A-Fa-f]+)>`)
 	triple := regexp.MustCompile(`<([0-9A-Fa-f]+)>\s*<([0-9A-Fa-f]+)>\s*<([0-9A-Fa-f]+)>`)
-	for _, line := range strings.Split(string(data), "\n") {
-		line = strings.TrimSpace(line)
-		if strings.Contains(line, "beginbfchar") {
-			mode = "char"
-			continue
-		}
-		if strings.Contains(line, "endbfchar") {
-			mode = ""
-			continue
-		}
-		if strings.Contains(line, "beginbfrange") {
-			mode = "range"
-			continue
-		}
-		if strings.Contains(line, "endbfrange") {
-			mode = ""
-			continue
-		}
-		if mode == "char" {
-			for _, m := range pair.FindAllStringSubmatch(line, -1) {
-				src, _ := hex.DecodeString(m[1])
-				dst, _ := hex.DecodeString(m[2])
-				out[string(src)] = utf16BE(dst)
-				if width == 0 {
-					width = len(src)
-				}
+	source := string(data)
+	charSections := regexp.MustCompile(`(?s)beginbfchar(.*?)endbfchar`).FindAllStringSubmatch(source, -1)
+	for _, section := range charSections {
+		for _, m := range pair.FindAllStringSubmatch(section[1], -1) {
+			src, _ := hex.DecodeString(m[1])
+			dst, _ := hex.DecodeString(m[2])
+			out[string(src)] = utf16BE(dst)
+			if width == 0 {
+				width = len(src)
 			}
 		}
-		if mode == "range" {
-			if m := triple.FindStringSubmatch(line); len(m) > 0 {
-				a, _ := strconv.ParseUint(m[1], 16, 32)
-				b, _ := strconv.ParseUint(m[2], 16, 32)
-				base, _ := strconv.ParseUint(m[3], 16, 32)
-				w := len(m[1]) / 2
-				if width == 0 {
-					width = w
+	}
+	rangeSections := regexp.MustCompile(`(?s)beginbfrange(.*?)endbfrange`).FindAllStringSubmatch(source, -1)
+	arrayRange := regexp.MustCompile(`(?s)<([0-9A-Fa-f]+)>\s*<([0-9A-Fa-f]+)>\s*\[(.*?)\]`)
+	hexValue := regexp.MustCompile(`<([0-9A-Fa-f]+)>`)
+	for _, section := range rangeSections {
+		body := section[1]
+		for _, m := range arrayRange.FindAllStringSubmatch(body, -1) {
+			a, _ := strconv.ParseUint(m[1], 16, 32)
+			b, _ := strconv.ParseUint(m[2], 16, 32)
+			values := hexValue.FindAllStringSubmatch(m[3], -1)
+			w := len(m[1]) / 2
+			if width == 0 {
+				width = w
+			}
+			for code := a; code <= b && int(code-a) < len(values); code++ {
+				src := make([]byte, w)
+				value := code
+				for i := w - 1; i >= 0; i-- {
+					src[i] = byte(value)
+					value >>= 8
 				}
-				for code := a; code <= b && code-a < 65536; code++ {
-					src := make([]byte, w)
-					value := code
-					for i := w - 1; i >= 0; i-- {
-						src[i] = byte(value)
-						value >>= 8
-					}
-					dst := fmt.Sprintf("%0*X", len(m[3]), base+(code-a))
-					db, _ := hex.DecodeString(dst)
-					out[string(src)] = utf16BE(db)
+				dst, _ := hex.DecodeString(values[code-a][1])
+				out[string(src)] = utf16BE(dst)
+			}
+		}
+		body = arrayRange.ReplaceAllString(body, "")
+		for _, m := range triple.FindAllStringSubmatch(body, -1) {
+			a, _ := strconv.ParseUint(m[1], 16, 32)
+			b, _ := strconv.ParseUint(m[2], 16, 32)
+			base, _ := strconv.ParseUint(m[3], 16, 32)
+			w := len(m[1]) / 2
+			if width == 0 {
+				width = w
+			}
+			for code := a; code <= b && code-a < 65536; code++ {
+				src := make([]byte, w)
+				value := code
+				for i := w - 1; i >= 0; i-- {
+					src[i] = byte(value)
+					value >>= 8
 				}
+				dst := fmt.Sprintf("%0*X", len(m[3]), base+(code-a))
+				db, _ := hex.DecodeString(dst)
+				out[string(src)] = utf16BE(db)
 			}
 		}
 	}

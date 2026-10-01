@@ -97,6 +97,7 @@ func extract(path string) error {
 	}
 
 	imageCount := 0
+	tableCount := 0
 	for _, page := range doc.Pages {
 		txtPath := filepath.Join(outDir, fmt.Sprintf("page_%d.txt", page.Number))
 		if err := os.WriteFile(txtPath, []byte(page.Text), 0o644); err != nil {
@@ -121,9 +122,21 @@ func extract(path string) error {
 				return err
 			}
 		}
+		for tableIndex, table := range page.Tables {
+			content := fce.TableTSV(table)
+			if content == "" {
+				continue
+			}
+			tableCount++
+			tablePath := filepath.Join(outDir, fmt.Sprintf("page_%d_table_%d.tsv", page.Number, tableIndex+1))
+			if err := os.WriteFile(tablePath, []byte(content), 0o644); err != nil {
+				fmt.Printf("失败 %s: 写 %s: %v\n", path, tablePath, err)
+				return err
+			}
+		}
 	}
-	fmt.Printf("提取 %s -> %s (%d 页, %d 张图片) 耗时: %s\n",
-		path, outDir, len(doc.Pages), imageCount, time.Since(start).Round(time.Millisecond))
+	fmt.Printf("提取 %s -> %s (%d 页, %d 张图片, %d 个表格) 耗时: %s\n",
+		path, outDir, len(doc.Pages), imageCount, tableCount, time.Since(start).Round(time.Millisecond))
 	return nil
 }
 

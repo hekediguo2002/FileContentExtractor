@@ -329,6 +329,12 @@ func buildStyledParagraphs(chars []styledChar, data []byte) []layout.Paragraph {
 	var run strings.Builder
 	current := charStyle{}
 	haveStyle := false
+	tableSerial := 0
+	activeTable := 0
+	tableRow, tableCell := 0, 0
+	cellStart := 0
+	plainBreaks := 0
+	separatedFromTable := false
 	flush := func() {
 		if run.Len() == 0 {
 			return
@@ -343,14 +349,65 @@ func buildStyledParagraphs(chars []styledChar, data []byte) []layout.Paragraph {
 		currentParagraph = layout.Paragraph{}
 		haveStyle = false
 	}
-	for _, ch := range chars {
+	for index, ch := range chars {
 		if ch.r == '\f' {
 			flushParagraph()
 			paragraphs[len(paragraphs)-1].BreakAfter = true
+			activeTable = 0
+			plainBreaks = 0
+			separatedFromTable = false
 			continue
 		}
-		if ch.r == '\r' || ch.r == '\v' || ch.r == 0x07 {
+		if ch.r == '\r' || ch.r == '\v' {
 			flushParagraph()
+			plainBreaks++
+			if plainBreaks >= 2 {
+				separatedFromTable = true
+			}
+			continue
+		}
+		if ch.r == 0x07 {
+			// A DOC table cell ends in 0x07. Word emits another 0x07 after
+			// the final cell of a row; consume that second marker as the row
+			// boundary rather than creating a spurious empty cell.
+			if index > 0 && chars[index-1].r == 0x07 {
+				plainBreaks = 0
+				continue
+			}
+			flushParagraph()
+			if activeTable == 0 || separatedFromTable {
+				tableSerial++
+				activeTable = tableSerial
+				tableRow, tableCell = 0, 0
+				cellStart = len(paragraphs) - 1
+				if cellStart < 0 {
+					cellStart = 0
+				}
+			}
+			for i := cellStart; i < len(paragraphs); i++ {
+				paragraphs[i].TableID = activeTable
+				paragraphs[i].TableRow = tableRow
+				paragraphs[i].TableCell = tableCell
+				paragraphs[i].RowSpan = 1
+				paragraphs[i].ColSpan = 1
+			}
+			rowEnd := index+1 < len(chars) && chars[index+1].r == 0x07
+			if len(paragraphs) > 0 {
+				if rowEnd {
+					paragraphs[len(paragraphs)-1].SeparatorAfter = "\n"
+				} else {
+					paragraphs[len(paragraphs)-1].SeparatorAfter = "\t"
+				}
+			}
+			if rowEnd {
+				tableRow++
+				tableCell = 0
+			} else {
+				tableCell++
+			}
+			cellStart = len(paragraphs)
+			plainBreaks = 0
+			separatedFromTable = false
 			continue
 		}
 		if ch.r == 1 {
@@ -370,6 +427,7 @@ func buildStyledParagraphs(chars []styledChar, data []byte) []layout.Paragraph {
 			haveStyle = true
 		}
 		run.WriteRune(r)
+		plainBreaks = 0
 	}
 	flush()
 	if len(currentParagraph.Runs) > 0 || len(currentParagraph.Images) > 0 {

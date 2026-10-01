@@ -3,7 +3,13 @@
 package rtf
 
 import (
+	"bytes"
+	"encoding/hex"
 	"fmt"
+	"image"
+	_ "image/gif"
+	_ "image/jpeg"
+	_ "image/png"
 	"os"
 	"regexp"
 	"strconv"
@@ -67,6 +73,7 @@ type state struct {
 	color     int
 	alignment string
 	ucSkip    int
+	inTable   bool
 }
 
 func defaultState() state { return state{fontSize: 12, ucSkip: 1} }
@@ -84,7 +91,7 @@ func ParseFile(name string) (*model.Document, error) {
 	source := string(raw) // latin-1 语义：字节即码点
 	fonts := fontTable(source)
 	colors := colorTable(source)
-	paragraphs, width, height := parse(source, fonts, colors)
+	paragraphs, width, height := parse(source, fonts, colors, extractPictures(source))
 
 	d := &model.Document{Path: name, Format: "rtf", Pagination: "layout-estimated"}
 	d.Pages = layout.Paginate(paragraphs, layout.Options{Width: width, Height: height})
@@ -167,15 +174,21 @@ func colorTable(source string) []string {
 	return out
 }
 
-func parse(source string, fonts map[int]string, colors []string) ([]layout.Paragraph, float64, float64) {
+func parse(source string, fonts map[int]string, colors []string, pictures []model.Image) ([]layout.Paragraph, float64, float64) {
 	st := defaultState()
 	stack := []state{}
 	var spans []model.TextRun
 	var paragraphs []layout.Paragraph
+	currentParagraph := layout.Paragraph{}
 	unicodeFallback := 0
 	pendingIgnorable := false
 	width, height := 612.0, 792.0
 	var ansiBytes []byte
+	pictureIndex := 0
+	pendingSectionBreak := false
+	tableSerial, activeTable := 0, 0
+	tableRow, tableCell, cellStart := 0, 0, 0
+	afterTableRow := false
 
 	appendText := func(text string) {}
 	flushAnsi := func() {}
@@ -206,7 +219,7 @@ func parse(source string, fonts map[int]string, colors []string) ([]layout.Parag
 		appendText(text)
 	}
 	flushParagraph := func() {
-		if len(spans) > 0 {
+		if len(spans) > 0 || len(currentParagraph.Images) > 0 {
 			hasText := false
 			for _, s := range spans {
 				if strings.TrimSpace(s.Text) != "" {
@@ -214,11 +227,44 @@ func parse(source string, fonts map[int]string, colors []string) ([]layout.Parag
 					break
 				}
 			}
-			if hasText {
-				paragraphs = append(paragraphs, layout.Paragraph{Runs: spans})
+			if hasText || len(currentParagraph.Images) > 0 {
+				currentParagraph.Runs = spans
+				paragraphs = append(paragraphs, currentParagraph)
 			}
 			spans = nil
+			currentParagraph = layout.Paragraph{}
 		}
+	}
+	markCell := func(rowEnd bool) {
+		flushParagraph()
+		if activeTable == 0 {
+			tableSerial++
+			activeTable = tableSerial
+			tableRow, tableCell = 0, 0
+			cellStart = maxInt(0, len(paragraphs)-1)
+		}
+		for i := cellStart; i < len(paragraphs); i++ {
+			paragraphs[i].TableID = activeTable
+			paragraphs[i].TableRow = tableRow
+			paragraphs[i].TableCell = tableCell
+			paragraphs[i].RowSpan = 1
+			paragraphs[i].ColSpan = 1
+		}
+		if len(paragraphs) > 0 {
+			if rowEnd {
+				paragraphs[len(paragraphs)-1].SeparatorAfter = "\n"
+			} else {
+				paragraphs[len(paragraphs)-1].SeparatorAfter = "\t"
+			}
+		}
+		if rowEnd {
+			tableRow++
+			tableCell = 0
+			afterTableRow = true
+		} else {
+			tableCell++
+		}
+		cellStart = len(paragraphs)
 	}
 	markPageBreak := func() {
 		flushParagraph()
@@ -275,6 +321,12 @@ func parse(source string, fonts map[int]string, colors []string) ([]layout.Parag
 				value, _ = strconv.Atoi(param)
 				hasValue = true
 			}
+			if word == "pict" {
+				if pictureIndex < len(pictures) {
+					currentParagraph.Images = append(currentParagraph.Images, pictures[pictureIndex])
+				}
+				pictureIndex++
+			}
 			if pendingIgnorable || destinations[word] {
 				st.ignorable = true
 				pendingIgnorable = false
@@ -296,14 +348,49 @@ func parse(source string, fonts map[int]string, colors []string) ([]layout.Parag
 					appendText(string(rune(value)))
 					unicodeFallback = st.ucSkip
 				}
-			case "par", "row", "cell":
+			case "par":
 				flushParagraph()
+				if afterTableRow && !st.inTable {
+					activeTable = 0
+					afterTableRow = false
+				}
+			case "trowd":
+				if activeTable == 0 {
+					tableSerial++
+					activeTable = tableSerial
+					tableRow, tableCell = 0, 0
+				}
+				cellStart = len(paragraphs)
+				afterTableRow = false
+			case "intbl":
+				st.inTable = !hasValue || value != 0
+			case "cell":
+				markCell(false)
+			case "row":
+				if cellStart < len(paragraphs) || len(spans) > 0 || len(currentParagraph.Images) > 0 {
+					markCell(true)
+				} else if len(paragraphs) > 0 {
+					paragraphs[len(paragraphs)-1].SeparatorAfter = "\n"
+					tableRow++
+					tableCell = 0
+					afterTableRow = true
+				}
 			case "line":
 				appendText("\n")
 			case "tab":
 				appendText("\t")
 			case "page":
 				markPageBreak()
+			case "sect":
+				flushParagraph()
+				pendingSectionBreak = true
+			case "sbkpage", "sbkodd", "sbkeven":
+				if pendingSectionBreak {
+					markPageBreak()
+				}
+				pendingSectionBreak = false
+			case "sbknone", "sbkcol":
+				pendingSectionBreak = false
 			case "f":
 				if hasValue {
 					st.font = value
@@ -325,6 +412,7 @@ func parse(source string, fonts map[int]string, colors []string) ([]layout.Parag
 			case "pard":
 				st.font, st.fontSize, st.color = 0, 12, 0
 				st.alignment = ""
+				st.inTable = false
 			case "plain":
 				st.font, st.fontSize, st.color = 0, 12, 0
 			case "paperw":
@@ -351,6 +439,129 @@ func parse(source string, fonts map[int]string, colors []string) ([]layout.Parag
 	flushAnsi()
 	flushParagraph()
 	return paragraphs, width, height
+}
+
+var pictureHexRe = regexp.MustCompile(`(?i)(?:[0-9a-f]{2}[ \t\r\n]*){16,}`)
+
+func extractPictures(source string) []model.Image {
+	groups := extractGroups(source, "pict")
+	images := make([]model.Image, 0, len(groups))
+	for index, group := range groups {
+		format := "raw"
+		switch {
+		case strings.Contains(group, `\pngblip`):
+			format = "png"
+		case strings.Contains(group, `\jpegblip`):
+			format = "jpg"
+		case strings.Contains(group, `\emfblip`):
+			format = "emf"
+		case strings.Contains(group, `\wmetafile`):
+			format = "wmf"
+		case strings.Contains(group, `\dibitmap`):
+			format = "dib"
+		}
+		var longest string
+		for _, match := range pictureHexRe.FindAllString(group, -1) {
+			clean := strings.Map(func(r rune) rune {
+				if r == ' ' || r == '\t' || r == '\r' || r == '\n' {
+					return -1
+				}
+				return r
+			}, match)
+			if len(clean) > len(longest) {
+				longest = clean
+			}
+		}
+		data, _ := hex.DecodeString(longest)
+		data = trimPictureHeader(data, format)
+		imageValue := model.Image{Name: fmt.Sprintf("rtf-image-%d.%s", index+1, format), Format: format, Data: data}
+		if config, _, err := image.DecodeConfig(bytes.NewReader(data)); err == nil {
+			imageValue.Width, imageValue.Height = config.Width, config.Height
+		}
+		if value := rtfControlValue(group, "picwgoal"); value > 0 {
+			imageValue.Bounds.Width = float64(value) / 20
+		}
+		if value := rtfControlValue(group, "pichgoal"); value > 0 {
+			imageValue.Bounds.Height = float64(value) / 20
+		}
+		if imageValue.Bounds.Width == 0 {
+			imageValue.Bounds.Width = float64(imageValue.Width) * .75
+		}
+		if imageValue.Bounds.Height == 0 {
+			imageValue.Bounds.Height = float64(imageValue.Height) * .75
+		}
+		if len(data) > 0 {
+			images = append(images, imageValue)
+		}
+	}
+	return images
+}
+
+func trimPictureHeader(data []byte, format string) []byte {
+	var signature []byte
+	switch format {
+	case "png":
+		signature = []byte("\x89PNG\r\n\x1a\n")
+	case "jpg":
+		signature = []byte{0xff, 0xd8, 0xff}
+	case "gif":
+		signature = []byte("GIF8")
+	}
+	if len(signature) > 0 {
+		if index := bytes.Index(data, signature); index >= 0 {
+			return data[index:]
+		}
+	}
+	return data
+}
+
+func extractGroups(source, control string) []string {
+	prefix := `{\` + control
+	var groups []string
+	for offset := 0; offset < len(source); {
+		index := strings.Index(source[offset:], prefix)
+		if index < 0 {
+			break
+		}
+		start := offset + index
+		depth, escaped := 0, false
+		end := -1
+		for i := start; i < len(source); i++ {
+			char := source[i]
+			if escaped {
+				escaped = false
+				continue
+			}
+			if char == '\\' {
+				escaped = true
+				continue
+			}
+			if char == '{' {
+				depth++
+			} else if char == '}' {
+				depth--
+				if depth == 0 {
+					end = i + 1
+					break
+				}
+			}
+		}
+		if end < 0 {
+			break
+		}
+		groups = append(groups, source[start:end])
+		offset = end
+	}
+	return groups
+}
+
+func rtfControlValue(group, name string) int {
+	match := regexp.MustCompile(`\\` + regexp.QuoteMeta(name) + `(-?\d+)`).FindStringSubmatch(group)
+	if len(match) < 2 {
+		return 0
+	}
+	value, _ := strconv.Atoi(match[1])
+	return value
 }
 
 func math2(v float64) float64 {

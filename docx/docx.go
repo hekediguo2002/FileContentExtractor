@@ -31,6 +31,15 @@ type floatingContent struct {
 	pageHint   int
 }
 
+type bodyParagraph struct {
+	node           xmlNode
+	tableID        int
+	row, cell      int
+	rowSpan        int
+	colSpan        int
+	separatorAfter string
+}
+
 func attr(n xmlNode, local string) string {
 	for _, a := range n.Attrs {
 		if a.Name.Local == local {
@@ -50,23 +59,77 @@ func find(n xmlNode, local string) []xmlNode {
 	return out
 }
 
-func bodyParagraphs(n xmlNode) []xmlNode {
-	var out []xmlNode
-	var walk func(xmlNode)
-	walk = func(parent xmlNode) {
+func bodyParagraphs(n xmlNode) []bodyParagraph {
+	body := n
+	if bodies := find(n, "body"); len(bodies) > 0 {
+		body = bodies[0]
+	}
+	var out []bodyParagraph
+	tableID := 0
+	var walk func(xmlNode, *bodyParagraph)
+	walk = func(parent xmlNode, context *bodyParagraph) {
 		for _, child := range parent.Nodes {
-			if child.XMLName.Local == "txbxContent" {
+			switch child.XMLName.Local {
+			case "txbxContent":
 				continue
+			case "p":
+				item := bodyParagraph{node: child, rowSpan: 1, colSpan: 1}
+				if context != nil {
+					item.tableID, item.row, item.cell = context.tableID, context.row, context.cell
+					item.rowSpan, item.colSpan = context.rowSpan, context.colSpan
+				}
+				out = append(out, item)
+			case "tbl":
+				tableID++
+				currentID := tableID
+				rows := directChildren(child, "tr")
+				for rowIndex, row := range rows {
+					cells := directChildren(row, "tc")
+					column := 0
+					for cellIndex, cell := range cells {
+						span := tableGridSpan(cell)
+						ctx := &bodyParagraph{tableID: currentID, row: rowIndex, cell: column, rowSpan: 1, colSpan: span}
+						start := len(out)
+						walk(cell, ctx)
+						if len(out) == start {
+							out = append(out, bodyParagraph{node: xmlNode{XMLName: xml.Name{Local: "p"}}, tableID: currentID, row: rowIndex, cell: column, rowSpan: 1, colSpan: span})
+						}
+						if cellIndex+1 < len(cells) {
+							out[len(out)-1].separatorAfter = "\t"
+						} else {
+							out[len(out)-1].separatorAfter = "\n"
+						}
+						column += span
+					}
+				}
+			default:
+				walk(child, context)
 			}
-			if child.XMLName.Local == "p" {
-				out = append(out, child)
-				continue
-			}
-			walk(child)
 		}
 	}
-	walk(n)
+	walk(body, nil)
 	return out
+}
+
+func directChildren(n xmlNode, local string) []xmlNode {
+	var out []xmlNode
+	for _, child := range n.Nodes {
+		if child.XMLName.Local == local {
+			out = append(out, child)
+		}
+	}
+	return out
+}
+
+func tableGridSpan(cell xmlNode) int {
+	if properties, ok := child(cell, "tcPr"); ok {
+		if span, ok := child(properties, "gridSpan"); ok {
+			if value, err := strconv.Atoi(attr(span, "val")); err == nil && value > 0 {
+				return value
+			}
+		}
+	}
+	return 1
 }
 
 func paragraphDescendants(n xmlNode, local string) []xmlNode {
@@ -161,10 +224,14 @@ func ParseFile(name string) (*root.Document, error) {
 	pageHint := 0
 	useRenderedBreaks := len(find(rootNode, "lastRenderedPageBreak")) > 0
 	body := bodyParagraphs(rootNode)
-	for paragraphIndex, p := range body {
+	for paragraphIndex, block := range body {
+		p := block.node
 		renderedBreaks := len(paragraphDescendants(p, "lastRenderedPageBreak"))
 		base := root.TextRun{Size: 11, Color: "#000000"}
-		item := layout.Paragraph{}
+		item := layout.Paragraph{
+			TableID: block.tableID, TableRow: block.row, TableCell: block.cell,
+			RowSpan: block.rowSpan, ColSpan: block.colSpan, SeparatorAfter: block.separatorAfter,
+		}
 		sectionBreakAfter := false
 		if pp, ok := child(p, "pPr"); ok {
 			if rp, ok := child(pp, "rPr"); ok {
@@ -203,7 +270,12 @@ func ParseFile(name string) (*root.Document, error) {
 				if paragraphHasFlowContent(*current) {
 					current.BreakAfter = true
 					current.After = 0
-					items = append(items, layout.Paragraph{LineHeight: item.LineHeight, After: item.After})
+					items = append(items, layout.Paragraph{
+						LineHeight: item.LineHeight, After: item.After,
+						TableID: item.TableID, TableRow: item.TableRow, TableCell: item.TableCell,
+						RowSpan: item.RowSpan, ColSpan: item.ColSpan, SeparatorAfter: item.SeparatorAfter,
+					})
+					current.SeparatorAfter = ""
 				} else {
 					current.BreakBefore = true
 				}
@@ -258,7 +330,7 @@ func ParseFile(name string) (*root.Document, error) {
 			// lastRenderedPageBreak at the start of the following paragraph.
 			// They describe one boundary and must not create two pages.
 			duplicatedByNext := useRenderedBreaks && paragraphIndex+1 < len(body) &&
-				renderedBreakPrecedesContent(body[paragraphIndex+1])
+				renderedBreakPrecedesContent(body[paragraphIndex+1].node)
 			if !duplicatedByNext {
 				items[len(items)-1].BreakAfter = true
 			}

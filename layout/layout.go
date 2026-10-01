@@ -9,13 +9,19 @@ import (
 )
 
 type Paragraph struct {
-	Runs        []model.TextRun
-	Images      []model.Image
-	Before      float64
-	After       float64
-	LineHeight  float64
-	BreakBefore bool
-	BreakAfter  bool
+	Runs           []model.TextRun
+	Images         []model.Image
+	Before         float64
+	After          float64
+	LineHeight     float64
+	BreakBefore    bool
+	BreakAfter     bool
+	TableID        int
+	TableRow       int
+	TableCell      int
+	RowSpan        int
+	ColSpan        int
+	SeparatorAfter string
 }
 
 type Options struct {
@@ -25,11 +31,22 @@ type Options struct {
 }
 
 type line struct {
-	runs        []model.TextRun
-	images      []model.Image
-	height      float64
-	breakBefore bool
-	breakAfter  bool
+	runs           []model.TextRun
+	images         []model.Image
+	height         float64
+	breakBefore    bool
+	breakAfter     bool
+	tableID        int
+	tableRow       int
+	tableCell      int
+	rowSpan        int
+	colSpan        int
+	separatorAfter string
+}
+
+type pageTableState struct {
+	index int
+	rows  map[int]int
 }
 
 func Paginate(paragraphs []Paragraph, options Options) []model.Page {
@@ -56,6 +73,7 @@ func Paginate(paragraphs []Paragraph, options Options) []model.Page {
 		}
 	}
 	pages := []model.Page{{Number: 1, Width: options.Width, Height: options.Height}}
+	tableStates := map[int]map[int]*pageTableState{}
 	y := 0.0
 	cumulative := 0.0
 	nextTarget := usable
@@ -85,9 +103,11 @@ func Paginate(paragraphs []Paragraph, options Options) []model.Page {
 				nextTarget = usable * float64(len(pages))
 			}
 		}
+		lineRuns := make([]model.TextRun, 0, len(line.runs))
 		for _, run := range line.runs {
 			run.Bounds.Y = options.MarginTop + y
 			page.Runs = appendRun(page.Runs, run)
+			lineRuns = append(lineRuns, run)
 			if run.Text != "" {
 				page.Text += run.Text
 			}
@@ -96,7 +116,12 @@ func Paginate(paragraphs []Paragraph, options Options) []model.Page {
 			im.Bounds.Y = options.MarginTop + y
 			page.Images = append(page.Images, im)
 		}
-		if len(line.runs) > 0 && index+1 < len(lines) && !line.breakAfter {
+		if line.tableID > 0 {
+			appendTableLine(page, tableStates, line, lineRuns)
+		}
+		if line.separatorAfter != "" && !line.breakAfter {
+			page.Text += line.separatorAfter
+		} else if line.tableID == 0 && len(line.runs) > 0 && index+1 < len(lines) && !line.breakAfter {
 			page.Text += "\n"
 		}
 		y += line.height
@@ -111,9 +136,78 @@ func Paginate(paragraphs []Paragraph, options Options) []model.Page {
 		}
 	}
 	for i := range pages {
-		pages[i].Text = strings.TrimSpace(pages[i].Text)
+		pages[i].Text = strings.Trim(pages[i].Text, " \r\n")
 	}
 	return pages
+}
+
+func appendTableLine(page *model.Page, states map[int]map[int]*pageTableState, source line, runs []model.TextRun) {
+	pageStates := states[page.Number]
+	if pageStates == nil {
+		pageStates = map[int]*pageTableState{}
+		states[page.Number] = pageStates
+	}
+	state := pageStates[source.tableID]
+	if state == nil {
+		page.Tables = append(page.Tables, model.Table{})
+		state = &pageTableState{index: len(page.Tables) - 1, rows: map[int]int{}}
+		pageStates[source.tableID] = state
+	}
+	table := &page.Tables[state.index]
+	rowIndex, ok := state.rows[source.tableRow]
+	if !ok {
+		table.Rows = append(table.Rows, model.TableRow{})
+		rowIndex = len(table.Rows) - 1
+		state.rows[source.tableRow] = rowIndex
+	}
+	row := &table.Rows[rowIndex]
+	cellIndex := -1
+	for i := range row.Cells {
+		if row.Cells[i].Column == source.tableCell {
+			cellIndex = i
+			break
+		}
+	}
+	if cellIndex < 0 {
+		row.Cells = append(row.Cells, model.TableCell{
+			Row: source.tableRow, Column: source.tableCell,
+			RowSpan: maxInt(source.rowSpan, 1), ColSpan: maxInt(source.colSpan, 1),
+		})
+		cellIndex = len(row.Cells) - 1
+	}
+	cell := &row.Cells[cellIndex]
+	if len(runs) > 0 {
+		if cell.Text != "" {
+			cell.Text += "\n"
+		}
+		for _, run := range runs {
+			cell.Text += run.Text
+			cell.Bounds = unionRect(cell.Bounds, run.Bounds)
+			table.Bounds = unionRect(table.Bounds, run.Bounds)
+		}
+		cell.Runs = append(cell.Runs, runs...)
+	}
+}
+
+func unionRect(a, b model.Rect) model.Rect {
+	if a.Width == 0 && a.Height == 0 {
+		return b
+	}
+	if b.Width == 0 && b.Height == 0 {
+		return a
+	}
+	x := math.Min(a.X, b.X)
+	y := math.Min(a.Y, b.Y)
+	right := math.Max(a.X+a.Width, b.X+b.Width)
+	bottom := math.Max(a.Y+a.Height, b.Y+b.Height)
+	return model.Rect{X: x, Y: y, Width: right - x, Height: bottom - y}
+}
+
+func maxInt(a, b int) int {
+	if a > b {
+		return a
+	}
+	return b
 }
 
 func lineHasContent(line line) bool {
@@ -172,7 +266,10 @@ func makeLines(paragraphs []Paragraph, width float64) []line {
 		if p.Before > 0 {
 			lines = append(lines, line{height: p.Before})
 		}
-		current := line{}
+		newLine := func() line {
+			return line{tableID: p.TableID, tableRow: p.TableRow, tableCell: p.TableCell, rowSpan: p.RowSpan, colSpan: p.ColSpan}
+		}
+		current := newLine()
 		x := 0.0
 		flush := func(force bool) {
 			if len(current.runs) > 0 || force {
@@ -181,7 +278,7 @@ func makeLines(paragraphs []Paragraph, width float64) []line {
 				}
 				lines = append(lines, current)
 			}
-			current = line{}
+			current = newLine()
 			x = 0
 		}
 		for _, source := range p.Runs {
@@ -226,10 +323,17 @@ func makeLines(paragraphs []Paragraph, width float64) []line {
 				im.Bounds.Height *= scale
 			}
 			im.Bounds.X = 0
-			lines = append(lines, line{images: []model.Image{im}, height: math.Max(im.Bounds.Height, 1)})
+			imageLine := newLine()
+			imageLine.images = []model.Image{im}
+			imageLine.height = math.Max(im.Bounds.Height, 1)
+			lines = append(lines, imageLine)
 		}
+		lastContentLine := len(lines) - 1
 		if p.After > 0 {
 			lines = append(lines, line{height: p.After})
+		}
+		if p.SeparatorAfter != "" && lastContentLine >= firstLine {
+			lines[lastContentLine].separatorAfter = p.SeparatorAfter
 		}
 		if p.BreakAfter {
 			if len(lines) == 0 {

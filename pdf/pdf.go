@@ -13,6 +13,7 @@ import (
 	"math"
 	"os"
 	"regexp"
+	"sort"
 	"strconv"
 	"strings"
 	"unicode/utf16"
@@ -157,8 +158,12 @@ func parse(name string, b []byte) (*model.Document, error) {
 				content = append(content, '\n')
 			}
 		}
-		pg.Runs = parseText(content, fonts)
-		pg.Text = pageText(pg.Runs)
+		runs, textClips := parseText(content, fonts)
+		pg.Runs = runs
+		segments := parsePathSegments(content)
+		tables, tableRuns := detectTables(pg.Runs, textClips, segments)
+		pg.Tables = tables
+		pg.Text = pageTextWithTables(pg.Runs, pg.Tables, tableRuns)
 		pg.Images = pageImages(resources, objs)
 		d.Pages = append(d.Pages, pg)
 	}
@@ -468,6 +473,483 @@ func pageText(runs []model.TextRun) string {
 	}
 	return strings.TrimSpace(b.String())
 }
+
+type pathSegment struct {
+	x1, y1, x2, y2 float64
+}
+
+func parsePathSegments(data []byte) []pathSegment {
+	tokens := tokenize(string(data))
+	var path, rectangles []pathSegment
+	var result []pathSegment
+	var currentX, currentY, startX, startY float64
+	haveCurrent := false
+	number := func(index int) float64 {
+		if index < 0 || index >= len(tokens) {
+			return 0
+		}
+		value, _ := strconv.ParseFloat(tokens[index], 64)
+		return value
+	}
+	for i, token := range tokens {
+		switch token {
+		case "cm":
+			// parseText currently reports coordinates in the content stream's
+			// local coordinate system. Keep ruling lines in that same system;
+			// applying the page CTM here would vertically mirror one side only.
+			continue
+		case "m":
+			if i >= 2 {
+				currentX, currentY = number(i-2), number(i-1)
+				startX, startY = currentX, currentY
+				haveCurrent = true
+			}
+		case "l":
+			if i >= 2 && haveCurrent {
+				x, y := number(i-2), number(i-1)
+				path = append(path, pathSegment{currentX, currentY, x, y})
+				currentX, currentY = x, y
+			}
+		case "h":
+			if haveCurrent {
+				path = append(path, pathSegment{currentX, currentY, startX, startY})
+				currentX, currentY = startX, startY
+			}
+		case "re":
+			if i >= 4 {
+				x, y := number(i-4), number(i-3)
+				w, h := number(i-2), number(i-1)
+				x1, y1 := x, y
+				x2, y2 := x+w, y
+				x3, y3 := x+w, y+h
+				x4, y4 := x, y+h
+				rectangles = []pathSegment{{x1, y1, x2, y2}, {x2, y2, x3, y3}, {x3, y3, x4, y4}, {x4, y4, x1, y1}}
+				path = append(path, rectangles...)
+			}
+		case "S", "s", "B", "B*", "b", "b*":
+			result = append(result, path...)
+			path = nil
+			rectangles = nil
+			haveCurrent = false
+		case "f", "f*", "F":
+			// Thin filled rectangles are commonly used instead of stroked
+			// paths for table rules.
+			if len(rectangles) == 4 {
+				width := math.Hypot(rectangles[0].x2-rectangles[0].x1, rectangles[0].y2-rectangles[0].y1)
+				height := math.Hypot(rectangles[1].x2-rectangles[1].x1, rectangles[1].y2-rectangles[1].y1)
+				if width <= 3 || height <= 3 {
+					result = append(result, rectangles...)
+				}
+			}
+			path = nil
+			rectangles = nil
+			haveCurrent = false
+		case "n":
+			path = nil
+			rectangles = nil
+			haveCurrent = false
+		}
+	}
+	return result
+}
+
+type ruledLine struct {
+	coordinate float64
+	from, to   float64
+}
+
+func detectTables(runs []model.TextRun, clips []*model.Rect, segments []pathSegment) ([]model.Table, map[int]int) {
+	const (
+		axisTolerance = 1.5
+		maxRuleCount  = 10000
+		maxGridLevels = 512
+		maxTableCells = 4096
+	)
+	var horizontal, vertical []ruledLine
+	for _, segment := range segments {
+		dx, dy := math.Abs(segment.x2-segment.x1), math.Abs(segment.y2-segment.y1)
+		switch {
+		case dy <= axisTolerance && dx >= 4:
+			horizontal = append(horizontal, ruledLine{coordinate: (segment.y1 + segment.y2) / 2, from: math.Min(segment.x1, segment.x2), to: math.Max(segment.x1, segment.x2)})
+		case dx <= axisTolerance && dy >= 4:
+			vertical = append(vertical, ruledLine{coordinate: (segment.x1 + segment.x2) / 2, from: math.Min(segment.y1, segment.y2), to: math.Max(segment.y1, segment.y2)})
+		}
+	}
+	horizontal = mergeRuledLines(horizontal, axisTolerance)
+	vertical = mergeRuledLines(vertical, axisTolerance)
+	if len(horizontal) < 2 || len(vertical) < 2 || len(horizontal) > maxRuleCount || len(vertical) > maxRuleCount {
+		return nil, map[int]int{}
+	}
+	yLevels := uniqueCoordinates(horizontal, axisTolerance)
+	if len(yLevels) > maxGridLevels {
+		return nil, map[int]int{}
+	}
+	var cells []model.TableCell
+	for bottomIndex := 0; bottomIndex+1 < len(yLevels); bottomIndex++ {
+		for topIndex := bottomIndex + 1; topIndex < len(yLevels); topIndex++ {
+			bottom, top := yLevels[bottomIndex], yLevels[topIndex]
+			if top-bottom < 3 {
+				continue
+			}
+			var xs []float64
+			for _, line := range vertical {
+				if covers(line.from, line.to, bottom, top, axisTolerance) {
+					xs = append(xs, line.coordinate)
+				}
+			}
+			xs = uniqueFloat64s(xs, axisTolerance)
+			for xi := 0; xi+1 < len(xs); xi++ {
+				left, right := xs[xi], xs[xi+1]
+				if right-left < 3 ||
+					!hasCoverage(horizontal, bottom, left, right, axisTolerance) ||
+					!hasCoverage(horizontal, top, left, right, axisTolerance) ||
+					hasInternalCoverage(horizontal, yLevels, bottomIndex, topIndex, left, right, axisTolerance) {
+					continue
+				}
+				cells = append(cells, model.TableCell{
+					Bounds:  model.Rect{X: left, Y: bottom, Width: right - left, Height: top - bottom},
+					RowSpan: topIndex - bottomIndex, ColSpan: 1,
+				})
+				if len(cells) > maxTableCells {
+					return nil, map[int]int{}
+				}
+			}
+		}
+	}
+	components := cellComponents(cells, axisTolerance)
+	tableRuns := map[int]int{}
+	var tables []model.Table
+	for _, component := range components {
+		if len(component) < 2 {
+			continue
+		}
+		table, assigned := buildPDFTable(component, runs, clips, axisTolerance)
+		if len(table.Rows) >= 2 || tableColumnCount(table) >= 2 {
+			tableIndex := len(tables)
+			tables = append(tables, table)
+			for runIndex := range assigned {
+				tableRuns[runIndex] = tableIndex
+			}
+		}
+	}
+	return tables, tableRuns
+}
+
+func mergeRuledLines(lines []ruledLine, tolerance float64) []ruledLine {
+	sort.Slice(lines, func(i, j int) bool {
+		if math.Abs(lines[i].coordinate-lines[j].coordinate) > tolerance {
+			return lines[i].coordinate < lines[j].coordinate
+		}
+		return lines[i].from < lines[j].from
+	})
+	var merged []ruledLine
+	for _, line := range lines {
+		if line.from > line.to {
+			line.from, line.to = line.to, line.from
+		}
+		if len(merged) > 0 {
+			last := &merged[len(merged)-1]
+			if math.Abs(last.coordinate-line.coordinate) <= tolerance && line.from <= last.to+tolerance {
+				last.coordinate = (last.coordinate + line.coordinate) / 2
+				last.to = math.Max(last.to, line.to)
+				continue
+			}
+		}
+		merged = append(merged, line)
+	}
+	return merged
+}
+
+func uniqueCoordinates(lines []ruledLine, tolerance float64) []float64 {
+	values := make([]float64, 0, len(lines))
+	for _, line := range lines {
+		values = append(values, line.coordinate)
+	}
+	return uniqueFloat64s(values, tolerance)
+}
+
+func uniqueFloat64s(values []float64, tolerance float64) []float64 {
+	sort.Float64s(values)
+	result := values[:0]
+	for _, value := range values {
+		if len(result) == 0 || math.Abs(value-result[len(result)-1]) > tolerance {
+			result = append(result, value)
+		} else {
+			result[len(result)-1] = (result[len(result)-1] + value) / 2
+		}
+	}
+	return result
+}
+
+func covers(from, to, wantedFrom, wantedTo, tolerance float64) bool {
+	return from <= wantedFrom+tolerance && to >= wantedTo-tolerance
+}
+
+func hasCoverage(lines []ruledLine, coordinate, from, to, tolerance float64) bool {
+	for _, line := range lines {
+		if math.Abs(line.coordinate-coordinate) <= tolerance && covers(line.from, line.to, from, to, tolerance) {
+			return true
+		}
+	}
+	return false
+}
+
+func hasInternalCoverage(lines []ruledLine, levels []float64, bottomIndex, topIndex int, from, to, tolerance float64) bool {
+	for index := bottomIndex + 1; index < topIndex; index++ {
+		if hasCoverage(lines, levels[index], from, to, tolerance) {
+			return true
+		}
+	}
+	return false
+}
+
+func cellComponents(cells []model.TableCell, tolerance float64) [][]model.TableCell {
+	visited := make([]bool, len(cells))
+	var components [][]model.TableCell
+	for start := range cells {
+		if visited[start] {
+			continue
+		}
+		visited[start] = true
+		queue := []int{start}
+		var component []model.TableCell
+		for len(queue) > 0 {
+			current := queue[0]
+			queue = queue[1:]
+			component = append(component, cells[current])
+			for next := range cells {
+				if !visited[next] && cellsTouch(cells[current].Bounds, cells[next].Bounds, tolerance) {
+					visited[next] = true
+					queue = append(queue, next)
+				}
+			}
+		}
+		components = append(components, component)
+	}
+	return components
+}
+
+func cellsTouch(a, b model.Rect, tolerance float64) bool {
+	xOverlap := math.Min(a.X+a.Width, b.X+b.Width)-math.Max(a.X, b.X) >= -tolerance
+	yOverlap := math.Min(a.Y+a.Height, b.Y+b.Height)-math.Max(a.Y, b.Y) >= -tolerance
+	return xOverlap && yOverlap
+}
+
+func buildPDFTable(cells []model.TableCell, runs []model.TextRun, clips []*model.Rect, tolerance float64) (model.Table, map[int]bool) {
+	ascendingY := tableTextRunsAscend(cells, runs, tolerance)
+	sort.Slice(cells, func(i, j int) bool {
+		if math.Abs(cells[i].Bounds.Y-cells[j].Bounds.Y) > tolerance {
+			if ascendingY {
+				return cells[i].Bounds.Y < cells[j].Bounds.Y
+			}
+			return cells[i].Bounds.Y > cells[j].Bounds.Y
+		}
+		return cells[i].Bounds.X < cells[j].Bounds.X
+	})
+	var table model.Table
+	for _, source := range cells {
+		rowIndex := -1
+		top := source.Bounds.Y
+		for i := range table.Rows {
+			if len(table.Rows[i].Cells) > 0 {
+				existing := table.Rows[i].Cells[0].Bounds
+				if math.Abs(existing.Y-top) <= tolerance {
+					rowIndex = i
+					break
+				}
+			}
+		}
+		if rowIndex < 0 {
+			table.Rows = append(table.Rows, model.TableRow{})
+			rowIndex = len(table.Rows) - 1
+		}
+		source.Row = rowIndex
+		table.Rows[rowIndex].Cells = append(table.Rows[rowIndex].Cells, source)
+		table.Bounds = unionPDFRect(table.Bounds, source.Bounds)
+	}
+	var columns []float64
+	for rowIndex := range table.Rows {
+		sort.Slice(table.Rows[rowIndex].Cells, func(i, j int) bool {
+			return table.Rows[rowIndex].Cells[i].Bounds.X < table.Rows[rowIndex].Cells[j].Bounds.X
+		})
+		for _, cell := range table.Rows[rowIndex].Cells {
+			columns = append(columns, cell.Bounds.X)
+			columns = append(columns, cell.Bounds.X+cell.Bounds.Width)
+		}
+	}
+	columns = uniqueFloat64s(columns, tolerance)
+	assigned := map[int]bool{}
+	for rowIndex := range table.Rows {
+		for cellIndex := range table.Rows[rowIndex].Cells {
+			cell := &table.Rows[rowIndex].Cells[cellIndex]
+			cell.Column = nearestCoordinate(columns, cell.Bounds.X)
+			right := nearestCoordinate(columns, cell.Bounds.X+cell.Bounds.Width)
+			cell.ColSpan = maxInt(right-cell.Column, 1)
+		}
+	}
+	for runIndex, run := range runs {
+		bestRow, bestCell := -1, -1
+		bestScore := 0.0
+		var clip *model.Rect
+		if runIndex < len(clips) {
+			clip = clips[runIndex]
+		}
+		for rowIndex := range table.Rows {
+			for cellIndex := range table.Rows[rowIndex].Cells {
+				score := runCellScore(run, clip, table.Rows[rowIndex].Cells[cellIndex].Bounds, tolerance)
+				if score > bestScore {
+					bestScore, bestRow, bestCell = score, rowIndex, cellIndex
+				}
+			}
+		}
+		if bestRow >= 0 {
+			cell := &table.Rows[bestRow].Cells[bestCell]
+			cell.Runs = append(cell.Runs, run)
+			assigned[runIndex] = true
+		}
+	}
+	for rowIndex := range table.Rows {
+		for cellIndex := range table.Rows[rowIndex].Cells {
+			cell := &table.Rows[rowIndex].Cells[cellIndex]
+			cell.Text = pageText(cell.Runs)
+		}
+	}
+	return table, assigned
+}
+
+func tableTextRunsAscend(cells []model.TableCell, runs []model.TextRun, tolerance float64) bool {
+	var bounds model.Rect
+	for _, cell := range cells {
+		bounds = unionPDFRect(bounds, cell.Bounds)
+	}
+	firstY, lastY := 0.0, 0.0
+	found := false
+	for _, run := range runs {
+		x := run.Bounds.X + math.Min(run.Bounds.Width/2, math.Max(run.Size*.25, 1))
+		y := run.Bounds.Y + run.Bounds.Height/2
+		if x < bounds.X-tolerance || x > bounds.X+bounds.Width+tolerance || y < bounds.Y-tolerance || y > bounds.Y+bounds.Height+tolerance {
+			continue
+		}
+		if !found {
+			firstY = y
+			found = true
+		}
+		lastY = y
+	}
+	return !found || lastY >= firstY
+}
+
+func nearestCoordinate(values []float64, wanted float64) int {
+	best := 0
+	for i := 1; i < len(values); i++ {
+		if math.Abs(values[i]-wanted) < math.Abs(values[best]-wanted) {
+			best = i
+		}
+	}
+	return best
+}
+
+func runCellScore(run model.TextRun, clip *model.Rect, cell model.Rect, tolerance float64) float64 {
+	x := run.Bounds.X + math.Min(run.Bounds.Width/2, math.Max(run.Size*.25, 1))
+	y := run.Bounds.Y + run.Bounds.Height/2
+	if clip != nil && clip.Width > 0 && clip.Height > 0 {
+		overlap := intersectionArea(*clip, cell)
+		clipArea := clip.Width * clip.Height
+		cellArea := cell.Width * cell.Height
+		if overlap > 0 && clipArea > 0 && cellArea > 0 {
+			clipCoverage := overlap / clipArea
+			cellCoverage := overlap / cellArea
+			// Some PDF generators position glyphs in a scaled local coordinate
+			// system but clip the text to the table cell in page coordinates.
+			// A clip that substantially matches one cell is therefore stronger
+			// evidence than a glyph position that appears in an adjacent cell.
+			if clipCoverage >= .8 && cellCoverage >= .5 {
+				return 3 + clipCoverage + cellCoverage
+			}
+		}
+	}
+	if x < cell.X-tolerance || x > cell.X+cell.Width+tolerance || y < cell.Y-tolerance || y > cell.Y+cell.Height+tolerance {
+		return 0
+	}
+	score := 1.0
+	if clip != nil && clip.Width > 0 && clip.Height > 0 {
+		overlap := intersectionArea(*clip, cell)
+		clipArea := clip.Width * clip.Height
+		if overlap > 0 && clipArea > 0 {
+			score += overlap / clipArea
+		}
+	}
+	// Prefer the smallest enclosing rectangle at merged-cell boundaries.
+	score += 1 / math.Max(cell.Width*cell.Height, 1)
+	return score
+}
+
+func intersectionArea(a, b model.Rect) float64 {
+	width := math.Min(a.X+a.Width, b.X+b.Width) - math.Max(a.X, b.X)
+	height := math.Min(a.Y+a.Height, b.Y+b.Height) - math.Max(a.Y, b.Y)
+	if width <= 0 || height <= 0 {
+		return 0
+	}
+	return width * height
+}
+
+func tableColumnCount(table model.Table) int {
+	maximum := 0
+	for _, row := range table.Rows {
+		for _, cell := range row.Cells {
+			maximum = maxInt(maximum, cell.Column+cell.ColSpan)
+		}
+	}
+	return maximum
+}
+
+func pageTextWithTables(runs []model.TextRun, tables []model.Table, tableRuns map[int]int) string {
+	var values []string
+	var plain []model.TextRun
+	emitted := map[int]bool{}
+	flushPlain := func() {
+		if text := pageText(plain); text != "" {
+			values = append(values, text)
+		}
+		plain = nil
+	}
+	for runIndex, run := range runs {
+		tableIndex, inTable := tableRuns[runIndex]
+		if !inTable {
+			plain = append(plain, run)
+			continue
+		}
+		flushPlain()
+		if !emitted[tableIndex] && tableIndex >= 0 && tableIndex < len(tables) {
+			values = append(values, tableText(tables[tableIndex]))
+			emitted[tableIndex] = true
+		}
+	}
+	flushPlain()
+	return strings.Trim(strings.Join(values, "\n"), " \r\n")
+}
+
+func tableText(table model.Table) string {
+	return model.TableTSV(table)
+}
+
+func unionPDFRect(a, b model.Rect) model.Rect {
+	if a.Width == 0 && a.Height == 0 {
+		return b
+	}
+	x := math.Min(a.X, b.X)
+	y := math.Min(a.Y, b.Y)
+	right := math.Max(a.X+a.Width, b.X+b.Width)
+	top := math.Max(a.Y+a.Height, b.Y+b.Height)
+	return model.Rect{X: x, Y: y, Width: right - x, Height: top - y}
+}
+
+func maxInt(a, b int) int {
+	if a > b {
+		return a
+	}
+	return b
+}
 func sortObjects(a []object) {
 	for i := range a {
 		for j := i + 1; j < len(a); j++ {
@@ -619,9 +1101,10 @@ func utf16BE(b []byte) string {
 	return string(utf16.Decode(u))
 }
 
-func parseText(data []byte, fonts map[string]fontInfo) []model.TextRun {
+func parseText(data []byte, fonts map[string]fontInfo) ([]model.TextRun, []*model.Rect) {
 	s := string(data)
 	runs := []model.TextRun{}
+	var runClips []*model.Rect
 	size := 12.0
 	scale := 1.0
 	font := fontInfo{}
@@ -715,6 +1198,7 @@ func parseText(data []byte, fonts map[string]fontInfo) []model.TextRun {
 					bounds := model.Rect{X: x, Y: y - eff, Width: w, Height: eff}
 					if visible(bounds, clip) {
 						runs = append(runs, model.TextRun{Text: txt, Font: font.name, Size: eff, Color: color, Bounds: bounds})
+						runClips = append(runClips, cloneRect(clip))
 					}
 					x += w
 				}
@@ -728,13 +1212,14 @@ func parseText(data []byte, fonts map[string]fontInfo) []model.TextRun {
 					bounds := model.Rect{X: x, Y: y - eff, Width: w, Height: eff}
 					if visible(bounds, clip) {
 						runs = append(runs, model.TextRun{Text: v, Font: font.name, Size: eff, Color: color, Bounds: bounds})
+						runClips = append(runClips, cloneRect(clip))
 					}
 					x += w
 				}
 			}
 		}
 	}
-	return runs
+	return runs, runClips
 }
 func cloneRect(r *model.Rect) *model.Rect {
 	if r == nil {

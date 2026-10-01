@@ -2,6 +2,8 @@
 
 使用 Go 标准库从 **DOCX、DOC、XLSX、XLS、PPTX、PPT、PDF、RTF、OFD** 中提取文字、文字样式、位置和内嵌图片。所有格式都会转换成统一的数据模型，方便业务代码处理。
 
+通过 `Open`/`Read` 返回的所有格式都会清理汉字及中文标点之间由 OCR 或排版产生的多余空格，例如 `关 于` 会规范为 `关于`；英文单词之间的空格保持不变。DOC、DOCX 和带网格线的 PDF 表格还会按最小单元格返回结构化内容。
+
 项目使用 Go 1.20，零第三方依赖，不需要安装 Office 或其他运行时组件。
 
 > 这是面向“内容提取”的只读解析器，不是完整的 Word、PDF 或 PowerPoint 排版引擎，也不执行 OCR。复杂排版的自动分页结果可能与原软件显示不同。
@@ -17,8 +19,8 @@
 | PPTX | 文本框、表格、文字样式 | 幻灯片图片 | 一张幻灯片一页 |
 | PPT | 幻灯片文字 | OfficeArt 图片 | 一张幻灯片一页 |
 | PDF | 常见页面文字和基础文字状态 | 常见页面图片 | PDF 原生页面 |
-| RTF | 普通文本、字体表、颜色表、Unicode | 不提取图片 | 按布局估算的页面 |
-| OFD | `TextObject` 文字和页面对象 | 记录位置 | OFD 原生页面 |
+| RTF | 普通文本、表格、字体表、颜色表、Unicode | PNG/JPEG 等 pict 图片 | 按布局估算的页面 |
+| OFD | `TextObject` 文字、网格表格和页面对象 | MultiMedia 图片数据及位置 | OFD 原生页面 |
 
 ## 快速开始
 
@@ -47,6 +49,13 @@ func main() {
             fmt.Printf("image %s: %dx%d, %d bytes\n",
                 image.Name, image.Width, image.Height, len(image.Data))
         }
+        for _, table := range page.Tables {
+            for _, row := range table.Rows {
+                for _, cell := range row.Cells {
+                    fmt.Printf("cell[%d,%d]: %s\n", cell.Row, cell.Column, cell.Text)
+                }
+            }
+        }
     }
 }
 ```
@@ -62,7 +71,7 @@ go run ./cmd/extract testfile    # 缺省目录为 test，不存在时退回 tes
 go run ./cmd/extract demo.docx   # 也支持单个文件
 ```
 
-输出形如 `demo/page_1.txt`、`demo/image_1.png`。图片扩展名按魔数嗅探真实格式（png/jpg/gif/bmp/tiff），识别不出时使用提取器给出的格式。
+输出形如 `demo/page_1.txt`、`demo/page_1_table_1.tsv`、`demo/image_1.png`。表格 TSV 每行对应一个表格行、使用制表符分隔单元格，并合并单元格内部的排版换行；图片扩展名按魔数嗅探真实格式（png/jpg/gif/bmp/tiff），识别不出时使用提取器给出的格式。
 
 ## 目录结构
 
@@ -97,6 +106,24 @@ type Page struct {
     Text          string   // 整页纯文本
     Runs          []TextRun
     Images        []Image
+    Tables        []Table
+}
+
+type Table struct {
+    Bounds Rect
+    Rows   []TableRow
+}
+
+type TableRow struct {
+    Cells []TableCell
+}
+
+type TableCell struct {
+    Row, Column      int
+    RowSpan, ColSpan int
+    Bounds           Rect
+    Text             string
+    Runs             []TextRun
 }
 
 type TextRun struct {
@@ -119,15 +146,17 @@ type Image struct {
 
 ## 能力边界
 
-PDF 支持常见的非加密 PDF、Flate 内容流、PDF 1.5 Object Stream、页面 MediaBox、`Tj`/`TJ`、ToUnicode CMap、字体/字号/颜色/基础坐标和页面引用图片。暂不支持加密文件、所有 PDF 过滤器、复杂文字变换、完整图形裁剪、Type 3 字体和无 ToUnicode 的任意自定义编码。
+PDF 支持常见的非加密 PDF、Flate 内容流、PDF 1.5 Object Stream、页面 MediaBox、`Tj`/`TJ`、ToUnicode CMap、字体/字号/颜色/基础坐标、页面引用图片，以及根据闭合横纵网格识别表格单元格。无边框表格无法仅凭 PDF 内容流可靠判断，会作为普通文字返回。暂不支持加密文件、所有 PDF 过滤器、复杂文字变换、完整图形裁剪、Type 3 字体和无 ToUnicode 的任意自定义编码。
 
-DOCX 支持正文及表格中的段落、运行级直接字体/字号/颜色、制表符/换行、显式分页符、lastRenderedPageBreak、节页面尺寸/页边距/段落间距/行距和内嵌图片。分页器按页面框进行换行和分页，并校验 `docProps/app.xml` 保存页数；明显失真的保存页数会被忽略。暂未计算完整样式表继承、复杂浮动环绕、页眉页脚和脚注。
+DOCX 支持正文及表格中的段落、`tbl/tr/tc` 单元格边界、运行级直接字体/字号/颜色、制表符/换行、显式分页符、lastRenderedPageBreak、节页面尺寸/页边距/段落间距/行距和内嵌图片。分页器按页面框进行换行和分页，并校验 `docProps/app.xml` 保存页数；明显失真的保存页数会被忽略。暂未计算完整样式表继承、复杂浮动环绕、页眉页脚和脚注。
 
-DOC 支持 OLE2 Compound File、WordDocument、0Table/1Table、Unicode/单字节 Piece Table、字符 CHPX FKP、SPRM 字号/颜色/字体索引、SttbfFfn 字体名称表，以及通过 `sprmCPicLocation` 读取 Data stream 中的 JPEG/PNG BLIP。分页器使用文件保存页数约束页面框布局，文本框内容按锚点字符位置附加到对应页面。单字节 piece 按字节读取，非 ASCII 旧代码页没有标准库字符集转换能力。
+DOC 支持 OLE2 Compound File、WordDocument、0Table/1Table、Unicode/单字节 Piece Table、`0x07` 单元格/行结束标记、字符 CHPX FKP、SPRM 字号/颜色/字体索引、SttbfFfn 字体名称表，以及通过 `sprmCPicLocation` 读取 Data stream 中的 JPEG/PNG BLIP。分页器使用文件保存页数约束页面框布局，文本框内容按锚点字符位置附加到对应页面。单字节 piece 按字节读取，非 ASCII 旧代码页没有标准库字符集转换能力。
 
-RTF 支持控制字解析、字体表/颜色表、`\uN` Unicode 转义与 `\'xx`（按 CP1252 解码），分页为布局估算。GBK 双字节序列不在支持范围内。
+表格同时保留在 `Page.Tables` 中；原始单元格段落和排版换行保留在 `TableCell.Text`。`Page.Text` 和 `TableTSV` 为兼容纯文本消费者，使用 `\t` 分隔单元格、使用换行分隔表格行，并合并单元格内部的排版换行。跨列单元格后会保留空字段，使各行列位置一致。
 
-OFD 支持包结构校验、公共资源字体表、TextObject 的边界/字号/颜色与行聚合。只提取既有文本，不做渲染或 OCR；图片仅记录边界位置。
+RTF 支持控制字解析、字体表/颜色表、`\uN` Unicode 转义与 `\'xx`（按 CP1252 解码）、`trowd/cell/row` 表格、`page` 及 `sect/sbkpage` 分页，并提取 `pict` 中的 PNG/JPEG 等图片。GBK 双字节序列不在支持范围内。
+
+OFD 支持包结构校验、公共资源字体表、TextObject 的边界/字号/颜色与行聚合、根据 PathObject 闭合横纵网格识别表格单元格，以及 `DocumentRes/PublicRes` 中 MultiMedia 图片和页面 `ImageObject` 的资源关联。只提取既有文本，不做渲染或 OCR。
 
 `Document.Pagination` 表示分页来源：PDF/OFD 为 `native`；DOC/DOCX/RTF 为 `layout-estimated`；HTML 伪 DOC 为 `single-flow`；XLS/XLSX 为 `worksheet`；PPT/PPTX 为 `slide`。DOC/DOCX/RTF 的自动分页遵循与 Writer 类似的页面框、可用内容区、行布局和溢出换页模型，但不是完整排版引擎，复杂表格、字体替换、浮动环绕和域可能造成页边界差异。
 

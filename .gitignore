@@ -8,3 +8,5 @@ coverage.out
 
 # Demo output
 testfile/*/
+
+cmd/extract/test

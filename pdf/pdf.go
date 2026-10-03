@@ -22,7 +22,7 @@ import (
 )
 
 type object struct {
-	num        int
+	num, gen   int
 	dict, data []byte
 }
 
@@ -50,13 +50,11 @@ func parse(name string, b []byte) (*model.Document, error) {
 	if !bytes.HasPrefix(bytes.TrimSpace(b), []byte("%PDF-")) {
 		return nil, fmt.Errorf("not a PDF")
 	}
-	if regexp.MustCompile(`/Encrypt\s+\d+\s+\d+\s+R`).Match(b) {
-		return nil, fmt.Errorf("encrypted PDF is not supported")
-	}
 	objs := map[int]object{}
 	ms := objRe.FindAllSubmatch(b, -1)
 	for _, m := range ms {
 		n, _ := strconv.Atoi(string(m[1]))
+		gen, _ := strconv.Atoi(string(m[2]))
 		body := m[3]
 		dict := body
 		var data []byte
@@ -73,7 +71,10 @@ func parse(name string, b []byte) (*model.Document, error) {
 				data = body[s : s+j]
 			}
 		}
-		objs[n] = object{n, dict, data}
+		objs[n] = object{num: n, gen: gen, dict: dict, data: data}
+	}
+	if err := decryptPDFObjects(b, objs); err != nil {
+		return nil, err
 	}
 	// PDF 1.5 object streams keep page dictionaries (and sometimes content
 	// streams) compressed inside an /ObjStm. Expand from a stable snapshot.
@@ -162,6 +163,9 @@ func parse(name string, b []byte) (*model.Document, error) {
 		pg.Runs = runs
 		segments := parsePathSegments(content)
 		tables, tableRuns := detectTables(pg.Runs, textClips, segments)
+		if len(tables) == 0 {
+			tables, tableRuns = detectClipTables(pg.Runs, textClips, segments, 3)
+		}
 		pg.Tables = tables
 		pg.Text = pageTextWithTables(pg.Runs, pg.Tables, tableRuns)
 		pg.Images = pageImages(resources, objs)
@@ -213,7 +217,7 @@ func pageImages(resources []byte, objs map[int]object) []model.Image {
 		if depth > maxRefDepth {
 			return
 		}
-		for _, id := range resourceRefs(dict, "XObject") {
+		for _, id := range resourceRefs(dict, "XObject", objs) {
 			if seen[id] {
 				continue
 			}
@@ -247,14 +251,7 @@ func extractImage(o object, objs map[int]object) model.Image {
 	if !strings.EqualFold(format, "FlateDecode") || w <= 0 || h <= 0 || int(dictNum(o.dict, "BitsPerComponent")) != 8 {
 		return result
 	}
-	channels := 0
-	if regexp.MustCompile(`/ColorSpace\s*/DeviceRGB\b`).Match(o.dict) {
-		channels = 3
-	} else if regexp.MustCompile(`/ColorSpace\s*/DeviceGray\b`).Match(o.dict) {
-		channels = 1
-	} else if regexp.MustCompile(`/ColorSpace\s*/DeviceCMYK\b`).Match(o.dict) {
-		channels = 4
-	}
+	channels := imageChannels(o.dict, objs)
 	// Untrusted Width/Height can be near maxInt: cap each dimension so the
 	// int64 product below cannot overflow and image.NewNRGBA cannot panic.
 	if channels == 0 || w > maxImageDimension || h > maxImageDimension || int64(w)*int64(h)*int64(channels) > int64(len(data)) {
@@ -291,6 +288,31 @@ func extractImage(o object, objs map[int]object) model.Image {
 		result.Data = encoded.Bytes()
 	}
 	return result
+}
+
+func imageChannels(dict []byte, objs map[int]object) int {
+	switch {
+	case regexp.MustCompile(`/ColorSpace\s*/DeviceRGB\b`).Match(dict):
+		return 3
+	case regexp.MustCompile(`/ColorSpace\s*/DeviceGray\b`).Match(dict):
+		return 1
+	case regexp.MustCompile(`/ColorSpace\s*/DeviceCMYK\b`).Match(dict):
+		return 4
+	}
+	match := regexp.MustCompile(`/ColorSpace\s*\[\s*/ICCBased\s+(\d+)\s+\d+\s+R`).FindSubmatch(dict)
+	if len(match) < 2 {
+		return 0
+	}
+	id, _ := strconv.Atoi(string(match[1]))
+	profile, ok := objs[id]
+	if !ok {
+		return 0
+	}
+	channels := int(dictNum(profile.dict, "N"))
+	if channels == 1 || channels == 3 || channels == 4 {
+		return channels
+	}
+	return 0
 }
 
 func applyJPEGSoftMask(result model.Image, o object, objs map[int]object) model.Image {
@@ -438,15 +460,31 @@ func contentRefs(d []byte) []int {
 	}
 	return out
 }
-func resourceRefs(d []byte, kind string) []int {
-	m := regexp.MustCompile(`(?s)/` + kind + `\s*<<(.+?)>>`).FindSubmatch(d)
-	if len(m) < 2 {
-		return nil
+func resourceRefs(d []byte, kind string, objs map[int]object) []int {
+	var dictionaries [][]byte
+	if direct := regexp.MustCompile(`(?s)/` + kind + `\s*<<(.+?)>>`).FindSubmatch(d); len(direct) > 1 {
+		dictionaries = append(dictionaries, direct[1])
 	}
+	// Scanner-generated PDFs commonly store /XObject as a reference to a
+	// separate resource dictionary rather than an inline <<...>> dictionary.
+	indirect := regexp.MustCompile(`/` + kind + `\s+(\d+)\s+\d+\s+R`)
+	for _, match := range indirect.FindAllSubmatch(d, -1) {
+		id, _ := strconv.Atoi(string(match[1]))
+		if resource, ok := objs[id]; ok {
+			dictionaries = append(dictionaries, resource.dict)
+		}
+	}
+	ref := regexp.MustCompile(`/[^\s/<>()\[\]]+\s+(\d+)\s+\d+\s+R`)
+	seen := map[int]bool{}
 	var out []int
-	for _, r := range regexp.MustCompile(`/[^\s/<>()\[\]]+\s+(\d+)\s+\d+\s+R`).FindAllSubmatch(m[1], -1) {
-		n, _ := strconv.Atoi(string(r[1]))
-		out = append(out, n)
+	for _, dictionary := range dictionaries {
+		for _, match := range ref.FindAllSubmatch(dictionary, -1) {
+			id, _ := strconv.Atoi(string(match[1]))
+			if !seen[id] {
+				seen[id] = true
+				out = append(out, id)
+			}
+		}
 	}
 	return out
 }
@@ -462,7 +500,7 @@ func pageText(runs []model.TextRun) string {
 		if !math.IsNaN(lastY) {
 			if math.Abs(r.Bounds.Y-lastY) > math.Max(lastSize, r.Size)*.55 {
 				b.WriteByte('\n')
-			} else if r.Bounds.X-lastEnd > math.Max(lastSize, r.Size)*.7 {
+			} else if r.Bounds.X-lastEnd > math.Max(lastSize, r.Size)*.2 {
 				b.WriteByte(' ')
 			}
 		}
@@ -560,7 +598,7 @@ type ruledLine struct {
 
 func detectTables(runs []model.TextRun, clips []*model.Rect, segments []pathSegment) ([]model.Table, map[int]int) {
 	const (
-		axisTolerance = 1.5
+		axisTolerance = 3.0
 		maxRuleCount  = 10000
 		maxGridLevels = 512
 		maxTableCells = 4096
@@ -598,6 +636,20 @@ func detectTables(runs []model.TextRun, clips []*model.Rect, segments []pathSegm
 				}
 			}
 			xs = uniqueFloat64s(xs, axisTolerance)
+			// Word commonly draws table rows with horizontal rules and internal
+			// column dividers while omitting the outer left/right borders. Infer
+			// those two boundaries from matching top and bottom rule endpoints.
+			if len(xs) > 0 {
+				bottomLeft, bottomRight, bottomOK := enclosingHorizontalSpan(horizontal, bottom, xs, axisTolerance)
+				topLeft, topRight, topOK := enclosingHorizontalSpan(horizontal, top, xs, axisTolerance)
+				if bottomOK && topOK {
+					left := math.Max(bottomLeft, topLeft)
+					right := math.Min(bottomRight, topRight)
+					if right-left >= 4 {
+						xs = uniqueFloat64s(append(xs, left, right), axisTolerance)
+					}
+				}
+			}
 			for xi := 0; xi+1 < len(xs); xi++ {
 				left, right := xs[xi], xs[xi+1]
 				if right-left < 3 ||
@@ -633,6 +685,139 @@ func detectTables(runs []model.TextRun, clips []*model.Rect, segments []pathSegm
 		}
 	}
 	return tables, tableRuns
+}
+
+func enclosingHorizontalSpan(lines []ruledLine, coordinate float64, dividers []float64, tolerance float64) (float64, float64, bool) {
+	if len(dividers) == 0 {
+		return 0, 0, false
+	}
+	leftDivider, rightDivider := dividers[0], dividers[len(dividers)-1]
+	bestLeft, bestRight := 0.0, 0.0
+	found := false
+	for _, line := range lines {
+		if math.Abs(line.coordinate-coordinate) > tolerance ||
+			line.from > leftDivider+tolerance || line.to < rightDivider-tolerance {
+			continue
+		}
+		if !found || line.to-line.from > bestRight-bestLeft {
+			bestLeft, bestRight, found = line.from, line.to, true
+		}
+	}
+	return bestLeft, bestRight, found
+}
+
+func detectClipTables(runs []model.TextRun, clips []*model.Rect, segments []pathSegment, tolerance float64) ([]model.Table, map[int]int) {
+	var candidates []model.TableCell
+	for runIndex, clip := range clips {
+		if clip == nil || clip.Width < 8 || clip.Height < 6 || runIndex >= len(runs) {
+			continue
+		}
+		run := runs[runIndex]
+		x := run.Bounds.X + run.Bounds.Width/2
+		y := run.Bounds.Y + run.Bounds.Height/2
+		if x < clip.X-tolerance || x > clip.X+clip.Width+tolerance || y < clip.Y-tolerance || y > clip.Y+clip.Height+tolerance {
+			continue
+		}
+		duplicate := false
+		for _, existing := range candidates {
+			if rectNearlyEqual(existing.Bounds, *clip, tolerance) {
+				duplicate = true
+				break
+			}
+		}
+		if !duplicate {
+			candidates = append(candidates, model.TableCell{Bounds: *clip, RowSpan: 1, ColSpan: 1})
+		}
+	}
+	filtered := candidates[:0]
+	for index, candidate := range candidates {
+		container := false
+		candidateArea := candidate.Bounds.Width * candidate.Bounds.Height
+		for otherIndex, other := range candidates {
+			if index == otherIndex {
+				continue
+			}
+			otherArea := other.Bounds.Width * other.Bounds.Height
+			if candidateArea > otherArea*1.5 && rectContains(candidate.Bounds, other.Bounds, tolerance) {
+				container = true
+				break
+			}
+		}
+		if !container {
+			filtered = append(filtered, candidate)
+		}
+	}
+
+	components := cellComponents(filtered, tolerance)
+	assignedTables := map[int]int{}
+	var tables []model.Table
+	for _, component := range components {
+		if len(component) < 4 {
+			continue
+		}
+		table, assigned := buildPDFTable(component, runs, clips, tolerance)
+		columns := tableColumnCount(table)
+		rowsWithMultipleCells := 0
+		for _, row := range table.Rows {
+			if len(row.Cells) >= 2 {
+				rowsWithMultipleCells++
+			}
+		}
+		if len(table.Rows) < 2 || columns < 2 || columns > 20 || rowsWithMultipleCells < 2 ||
+			!clipTableHasRules(table.Bounds, segments, tolerance) {
+			continue
+		}
+		tableIndex := len(tables)
+		tables = append(tables, table)
+		for runIndex := range assigned {
+			assignedTables[runIndex] = tableIndex
+		}
+	}
+	return tables, assignedTables
+}
+
+func clipTableHasRules(bounds model.Rect, segments []pathSegment, tolerance float64) bool {
+	var horizontal, vertical []ruledLine
+	for _, segment := range segments {
+		dx, dy := math.Abs(segment.x2-segment.x1), math.Abs(segment.y2-segment.y1)
+		switch {
+		case dy <= tolerance && dx >= 4:
+			horizontal = append(horizontal, ruledLine{coordinate: (segment.y1 + segment.y2) / 2, from: math.Min(segment.x1, segment.x2), to: math.Max(segment.x1, segment.x2)})
+		case dx <= tolerance && dy >= 4:
+			vertical = append(vertical, ruledLine{coordinate: (segment.x1 + segment.x2) / 2, from: math.Min(segment.y1, segment.y2), to: math.Max(segment.y1, segment.y2)})
+		}
+	}
+	horizontal = mergeRuledLines(horizontal, tolerance)
+	vertical = mergeRuledLines(vertical, tolerance)
+	horizontalCount := 0
+	for _, line := range horizontal {
+		if line.coordinate >= bounds.Y-tolerance && line.coordinate <= bounds.Y+bounds.Height+tolerance &&
+			line.from <= bounds.X+tolerance && line.to >= bounds.X+bounds.Width-tolerance {
+			horizontalCount++
+		}
+	}
+	if horizontalCount < 2 {
+		return false
+	}
+	for _, line := range vertical {
+		inside := line.coordinate > bounds.X+tolerance && line.coordinate < bounds.X+bounds.Width-tolerance
+		overlap := math.Min(line.to, bounds.Y+bounds.Height) - math.Max(line.from, bounds.Y)
+		if inside && overlap >= math.Min(bounds.Height*.25, 12) {
+			return true
+		}
+	}
+	return false
+}
+
+func rectNearlyEqual(a, b model.Rect, tolerance float64) bool {
+	return math.Abs(a.X-b.X) <= tolerance && math.Abs(a.Y-b.Y) <= tolerance &&
+		math.Abs(a.Width-b.Width) <= tolerance && math.Abs(a.Height-b.Height) <= tolerance
+}
+
+func rectContains(outer, inner model.Rect, tolerance float64) bool {
+	return outer.X <= inner.X+tolerance && outer.Y <= inner.Y+tolerance &&
+		outer.X+outer.Width >= inner.X+inner.Width-tolerance &&
+		outer.Y+outer.Height >= inner.Y+inner.Height-tolerance
 }
 
 func mergeRuledLines(lines []ruledLine, tolerance float64) []ruledLine {
@@ -868,7 +1053,8 @@ func runCellScore(run model.TextRun, clip *model.Rect, cell model.Rect, toleranc
 			}
 		}
 	}
-	if x < cell.X-tolerance || x > cell.X+cell.Width+tolerance || y < cell.Y-tolerance || y > cell.Y+cell.Height+tolerance {
+	textTolerance := math.Min(tolerance, math.Max(run.Size*.05, .25))
+	if x < cell.X-textTolerance || x > cell.X+cell.Width+textTolerance || y < cell.Y-textTolerance || y > cell.Y+cell.Height+textTolerance {
 		return 0
 	}
 	score := 1.0
@@ -996,35 +1182,101 @@ func decodeStream(dict, data []byte) []byte {
 }
 
 type fontInfo struct {
-	name  string
-	cmap  map[string]string
-	width int
+	name          string
+	encoding      string
+	cidCollection string
+	cmap          map[string]string
+	width         int
 }
 
 func pageFonts(dict []byte, objs map[int]object) map[string]fontInfo {
 	res := map[string]fontInfo{}
 	re := regexp.MustCompile(`/([^\s/<>()\[\]]+)\s+(\d+)\s+\d+\s+R`)
 	fontObject := regexp.MustCompile(`/(?:Type\s*/Font|Subtype\s*/Type)`)
-	for _, m := range re.FindAllSubmatch(dict, -1) {
-		id, _ := strconv.Atoi(string(m[2]))
+	addFont := func(name []byte, id int) {
 		o, ok := objs[id]
 		if !ok || !fontObject.Match(o.dict) {
-			continue
+			return
 		}
 		fi := fontInfo{}
 		if n := regexp.MustCompile(`/BaseFont\s*/([^\s/<>()\[\]]+)`).FindSubmatch(o.dict); len(n) > 1 {
 			fi.name = string(n[1])
 		}
+		if e := regexp.MustCompile(`/Encoding\s*/([^\s/<>()\[\]]+)`).FindSubmatch(o.dict); len(e) > 1 {
+			fi.encoding = string(e[1])
+		}
+		fi.cidCollection = fontCIDCollection(o, objs)
 		if u := regexp.MustCompile(`/ToUnicode\s+(\d+)\s+\d+\s+R`).FindSubmatch(o.dict); len(u) > 1 {
 			cid, _ := strconv.Atoi(string(u[1]))
 			if co, ok := objs[cid]; ok {
 				fi.cmap, fi.width = parseCMap(decodeStream(co.dict, co.data))
 			}
 		}
-		res[string(m[1])] = fi
+		if len(fi.cmap) == 0 && fi.encoding == "GBK-EUC-H" && fi.cidCollection == "Adobe-GB1" {
+			fi.cmap, fi.width = adobeGBKEUCCMap, adobeGBKEUCWidth
+		}
+		res[string(name)] = fi
+	}
+	for _, m := range re.FindAllSubmatch(dict, -1) {
+		id, _ := strconv.Atoi(string(m[2]))
+		addFont(m[1], id)
+	}
+	// Resource dictionaries may keep /Font itself in an indirect object:
+	// /Resources << /Font 12 0 R >>, with /F1, /F2 ... inside object 12.
+	// Resolve that extra level so the page's font aliases retain ToUnicode.
+	fontDictRef := regexp.MustCompile(`/Font\s+(\d+)\s+\d+\s+R`)
+	for _, m := range fontDictRef.FindAllSubmatch(dict, -1) {
+		id, _ := strconv.Atoi(string(m[1]))
+		fontDict, ok := objs[id]
+		if !ok {
+			continue
+		}
+		for _, entry := range re.FindAllSubmatch(fontDict.dict, -1) {
+			fontID, _ := strconv.Atoi(string(entry[2]))
+			addFont(entry[1], fontID)
+		}
 	}
 	return res
 }
+
+func fontCIDCollection(font object, objs map[int]object) string {
+	descendant := regexp.MustCompile(`/DescendantFonts\s*(?:\[\s*)?(\d+)\s+\d+\s+R`).FindSubmatch(font.dict)
+	if len(descendant) < 2 {
+		return ""
+	}
+	id, _ := strconv.Atoi(string(descendant[1]))
+	queue := []int{id}
+	seen := map[int]bool{}
+	refRe := regexp.MustCompile(`(\d+)\s+\d+\s+R`)
+	for len(queue) > 0 && len(seen) < 32 {
+		id = queue[0]
+		queue = queue[1:]
+		if seen[id] {
+			continue
+		}
+		seen[id] = true
+		o, ok := objs[id]
+		if !ok {
+			continue
+		}
+		if orderingBytes := dictionaryString(o.dict, "Ordering"); len(orderingBytes) > 0 {
+			ordering := string(orderingBytes)
+			registry := string(dictionaryString(o.dict, "Registry"))
+			if registry != "" {
+				return registry + "-" + ordering
+			}
+			return ordering
+		}
+		for _, ref := range refRe.FindAllSubmatch(o.dict, -1) {
+			next, _ := strconv.Atoi(string(ref[1]))
+			if !seen[next] {
+				queue = append(queue, next)
+			}
+		}
+	}
+	return ""
+}
+
 func parseCMap(data []byte) (map[string]string, int) {
 	out := map[string]string{}
 	width := 0
@@ -1037,7 +1289,7 @@ func parseCMap(data []byte) (map[string]string, int) {
 			src, _ := hex.DecodeString(m[1])
 			dst, _ := hex.DecodeString(m[2])
 			out[string(src)] = utf16BE(dst)
-			if width == 0 {
+			if len(src) > width {
 				width = len(src)
 			}
 		}
@@ -1052,7 +1304,7 @@ func parseCMap(data []byte) (map[string]string, int) {
 			b, _ := strconv.ParseUint(m[2], 16, 32)
 			values := hexValue.FindAllStringSubmatch(m[3], -1)
 			w := len(m[1]) / 2
-			if width == 0 {
+			if w > width {
 				width = w
 			}
 			for code := a; code <= b && int(code-a) < len(values); code++ {
@@ -1072,7 +1324,7 @@ func parseCMap(data []byte) (map[string]string, int) {
 			b, _ := strconv.ParseUint(m[2], 16, 32)
 			base, _ := strconv.ParseUint(m[3], 16, 32)
 			w := len(m[1]) / 2
-			if width == 0 {
+			if w > width {
 				width = w
 			}
 			for code := a; code <= b && code-a < 65536; code++ {
@@ -1113,6 +1365,29 @@ func parseText(data []byte, fonts map[string]fontInfo) ([]model.TextRun, []*mode
 	inText := false
 	var clip, pending *model.Rect
 	var clips []*model.Rect
+	var cidFallback *fontInfo
+	for _, candidate := range fonts {
+		if candidate.cidCollection == "Adobe-CNS1" {
+			copy := candidate
+			cidFallback = &copy
+			break
+		}
+	}
+	decodeText := func(token string) string {
+		value := decodePDFString(token, font)
+		if cidFallback == nil || !hasBinaryControls(value) {
+			return value
+		}
+		raw := pdfStringBytes(token)
+		if len(raw) == 0 || len(raw)%2 != 0 {
+			return value
+		}
+		candidate := decodeAdobeCNS1(raw)
+		if candidate != "" && !hasBinaryControls(candidate) {
+			return candidate
+		}
+		return value
+	}
 	// Tokenizer handles literal strings, hex strings, names, numbers and operators.
 	toks := tokenize(s)
 	for i := 0; i < len(toks); i++ {
@@ -1191,7 +1466,7 @@ func parseText(data []byte, fonts map[string]fontInfo) ([]model.TextRun, []*mode
 			}
 		case "Tj":
 			if i >= 1 {
-				txt := decodePDFString(toks[i-1], font)
+				txt := decodeText(toks[i-1])
 				if txt != "" {
 					eff := size * scale
 					w := float64(len([]rune(txt))) * eff * .5
@@ -1205,8 +1480,12 @@ func parseText(data []byte, fonts map[string]fontInfo) ([]model.TextRun, []*mode
 			}
 		case "TJ":
 			if i >= 1 {
-				for _, raw := range parseArrayStrings(toks[i-1]) {
-					v := decodePDFString(raw, font)
+				for _, raw := range parseArrayItems(toks[i-1]) {
+					if adjustment, err := strconv.ParseFloat(raw, 64); err == nil {
+						x -= adjustment / 1000 * size * scale
+						continue
+					}
+					v := decodeText(raw)
 					eff := size * scale
 					w := float64(len([]rune(v))) * eff * .5
 					bounds := model.Rect{X: x, Y: y - eff, Width: w, Height: eff}
@@ -1315,33 +1594,7 @@ func tokenize(s string) []string {
 	return out
 }
 func decodePDFString(t string, font fontInfo) string {
-	var raw []byte
-	if len(t) >= 2 && t[0] == '(' {
-		t = t[1 : len(t)-1]
-		var b strings.Builder
-		for i := 0; i < len(t); i++ {
-			if t[i] == '\\' && i+1 < len(t) {
-				i++
-				switch t[i] {
-				case 'n':
-					b.WriteByte('\n')
-				case 'r':
-					b.WriteByte('\r')
-				case 't':
-					b.WriteByte('\t')
-				default:
-					b.WriteByte(t[i])
-				}
-			} else {
-				b.WriteByte(t[i])
-			}
-		}
-		raw = []byte(b.String())
-	}
-	if strings.HasPrefix(t, "<") {
-		h := strings.Trim(t, "<>")
-		raw, _ = hex.DecodeString(h)
-	}
+	raw := pdfStringBytes(t)
 	if len(raw) == 0 {
 		return ""
 	}
@@ -1364,45 +1617,127 @@ func decodePDFString(t string, font fontInfo) string {
 				}
 			}
 			if !matched {
+				// A ToUnicode map is allowed to omit codes. Simple fonts can still
+				// recover those bytes through their declared base encoding.
+				if isSingleByteFontEncoding(font.encoding) {
+					b.WriteRune(decodeSimpleFontByte(raw[i], font.encoding))
+				}
 				i++
 			}
 		}
 		return b.String()
 	}
-	if len(raw) > 1 && len(raw)%2 == 0 {
-		return utf16BE(raw)
+	if font.encoding == "Identity-H" && font.cidCollection == "Adobe-CNS1" {
+		return decodeAdobeCNS1(raw)
 	}
-	return string(raw)
+	if len(raw) >= 2 && raw[0] == 0xfe && raw[1] == 0xff {
+		return utf16BE(raw[2:])
+	}
+	var b strings.Builder
+	for _, c := range raw {
+		b.WriteRune(decodeSimpleFontByte(c, font.encoding))
+	}
+	return b.String()
 }
-func parseArrayStrings(t string) []string {
-	var out []string
-	for i := 0; i < len(t); {
-		if t[i] == '(' {
-			j := i + 1
-			for j < len(t) && t[j] != ')' {
-				if t[j] == '\\' {
-					j++
+
+func pdfStringBytes(t string) []byte {
+	var raw []byte
+	if len(t) >= 2 && t[0] == '(' {
+		raw = decodePDFLiteral([]byte(t[1 : len(t)-1]))
+	}
+	if strings.HasPrefix(t, "<") {
+		h := strings.Trim(t, "<>")
+		raw, _ = hex.DecodeString(h)
+	}
+	return raw
+}
+
+func hasBinaryControls(text string) bool {
+	for _, r := range text {
+		if r == 0 || (r < 0x20 && r != '\t' && r != '\n' && r != '\r') || (r >= 0x7f && r <= 0x9f) {
+			return true
+		}
+	}
+	return false
+}
+
+func decodePDFLiteral(src []byte) []byte {
+	out := make([]byte, 0, len(src))
+	for i := 0; i < len(src); i++ {
+		if src[i] != '\\' {
+			out = append(out, src[i])
+			continue
+		}
+		if i+1 >= len(src) {
+			break
+		}
+		i++
+		switch src[i] {
+		case 'n':
+			out = append(out, '\n')
+		case 'r':
+			out = append(out, '\r')
+		case 't':
+			out = append(out, '\t')
+		case 'b':
+			out = append(out, '\b')
+		case 'f':
+			out = append(out, '\f')
+		case '\n':
+			// A backslash followed by an end-of-line is a continuation.
+		case '\r':
+			if i+1 < len(src) && src[i+1] == '\n' {
+				i++
+			}
+		default:
+			if src[i] >= '0' && src[i] <= '7' {
+				value := int(src[i] - '0')
+				for count := 1; count < 3 && i+1 < len(src) && src[i+1] >= '0' && src[i+1] <= '7'; count++ {
+					i++
+					value = value*8 + int(src[i]-'0')
 				}
-				j++
+				out = append(out, byte(value))
+			} else {
+				// Escaped parentheses and backslashes represent themselves.
+				out = append(out, src[i])
 			}
-			if j < len(t) {
-				j++
-			}
-			out = append(out, t[i:j])
-			i = j
-		} else if t[i] == '<' {
-			j := i + 1
-			for j < len(t) && t[j] != '>' {
-				j++
-			}
-			if j < len(t) {
-				j++
-			}
-			out = append(out, t[i:j])
-			i = j
-		} else {
-			i++
 		}
 	}
 	return out
+}
+
+func decodeSimpleFontByte(c byte, encoding string) rune {
+	if encoding == "WinAnsiEncoding" {
+		if r, ok := winAnsiRunes[c]; ok {
+			return r
+		}
+	}
+	return rune(c)
+}
+
+func isSingleByteFontEncoding(encoding string) bool {
+	switch encoding {
+	case "WinAnsiEncoding", "MacRomanEncoding", "MacExpertEncoding", "StandardEncoding":
+		return true
+	default:
+		return false
+	}
+}
+
+var winAnsiRunes = map[byte]rune{
+	0x80: '\u20ac', 0x81: '\u2022', 0x82: '\u201a', 0x83: '\u0192',
+	0x84: '\u201e', 0x85: '\u2026', 0x86: '\u2020', 0x87: '\u2021',
+	0x88: '\u02c6', 0x89: '\u2030', 0x8a: '\u0160', 0x8b: '\u2039',
+	0x8c: '\u0152', 0x8d: '\u2022', 0x8e: '\u017d', 0x8f: '\u2022',
+	0x90: '\u2022', 0x91: '\u2018', 0x92: '\u2019', 0x93: '\u201c',
+	0x94: '\u201d', 0x95: '\u2022', 0x96: '\u2013', 0x97: '\u2014',
+	0x98: '\u02dc', 0x99: '\u2122', 0x9a: '\u0161', 0x9b: '\u203a',
+	0x9c: '\u0153', 0x9d: '\u2022', 0x9e: '\u017e', 0x9f: '\u0178',
+}
+
+func parseArrayItems(t string) []string {
+	if len(t) >= 2 && t[0] == '[' && t[len(t)-1] == ']' {
+		t = t[1 : len(t)-1]
+	}
+	return tokenize(t)
 }

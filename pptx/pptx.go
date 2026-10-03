@@ -122,7 +122,17 @@ func ParseFile(name string) (*model.Document, error) {
 			appendContainerText(&page, shape)
 		}
 		for _, frame := range find(slide, "graphicFrame") {
-			appendContainerText(&page, frame)
+			if table, ok := parseTable(frame); ok {
+				page.Tables = append(page.Tables, table)
+				for _, row := range table.Rows {
+					for _, cell := range row.Cells {
+						page.Runs = append(page.Runs, cell.Runs...)
+					}
+				}
+				appendPageText(&page, model.TableTSV(table))
+			} else {
+				appendContainerText(&page, frame)
+			}
 		}
 		slideRels := rels(a[path.Join(path.Dir(slidePath), "_rels", path.Base(slidePath)+".rels")], path.Dir(slidePath))
 		for _, pic := range find(slide, "pic") {
@@ -152,6 +162,14 @@ func ParseFile(name string) (*model.Document, error) {
 
 func appendContainerText(page *model.Page, container node) {
 	bounds := shapeBounds(container)
+	text, runs := containerText(container, bounds)
+	page.Runs = append(page.Runs, runs...)
+	appendPageText(page, text)
+}
+
+func containerText(container node, bounds model.Rect) (string, []model.TextRun) {
+	var text strings.Builder
+	var runs []model.TextRun
 	for _, paragraph := range find(container, "p") {
 		var line strings.Builder
 		for _, runNode := range paragraphRuns(paragraph) {
@@ -162,15 +180,126 @@ func appendContainerText(page *model.Page, container node) {
 			style := runStyle(runNode)
 			style.Text = value
 			style.Bounds = bounds
-			page.Runs = append(page.Runs, style)
+			runs = append(runs, style)
 			line.WriteString(value)
 		}
 		if line.Len() > 0 {
-			if page.Text != "" {
-				page.Text += "\n"
+			if text.Len() > 0 {
+				text.WriteByte('\n')
 			}
-			page.Text += line.String()
+			text.WriteString(line.String())
 		}
+	}
+	return text.String(), runs
+}
+
+func appendPageText(page *model.Page, value string) {
+	if value == "" {
+		return
+	}
+	if page.Text != "" {
+		page.Text += "\n"
+	}
+	page.Text += value
+}
+
+func parseTable(frame node) (model.Table, bool) {
+	tables := find(frame, "tbl")
+	if len(tables) == 0 {
+		return model.Table{}, false
+	}
+	tableNode := tables[0]
+	table := model.Table{Bounds: shapeBounds(frame)}
+
+	var columnWidths []float64
+	if grid, ok := direct(tableNode, "tblGrid"); ok {
+		for _, column := range grid.Nodes {
+			if column.XMLName.Local == "gridCol" {
+				columnWidths = append(columnWidths, emu(attr(column, "w")))
+			}
+		}
+	}
+	var rowNodes []node
+	for _, child := range tableNode.Nodes {
+		if child.XMLName.Local == "tr" {
+			rowNodes = append(rowNodes, child)
+		}
+	}
+	rowHeights := make([]float64, len(rowNodes))
+	for i, row := range rowNodes {
+		rowHeights[i] = emu(attr(row, "h"))
+	}
+	columnOffsets := scaledOffsets(columnWidths, table.Bounds.Width)
+	rowOffsets := scaledOffsets(rowHeights, table.Bounds.Height)
+
+	for rowIndex, rowNode := range rowNodes {
+		row := model.TableRow{}
+		columnIndex := 0
+		for _, cellNode := range rowNode.Nodes {
+			if cellNode.XMLName.Local != "tc" {
+				continue
+			}
+			columnSpan := positiveInt(attr(cellNode, "gridSpan"))
+			rowSpan := positiveInt(attr(cellNode, "rowSpan"))
+			continuation := xmlBool(attr(cellNode, "hMerge")) || xmlBool(attr(cellNode, "vMerge"))
+			if !continuation {
+				bounds := tableCellBounds(table.Bounds, columnOffsets, rowOffsets, columnIndex, rowIndex, columnSpan, rowSpan)
+				text, runs := containerText(cellNode, bounds)
+				row.Cells = append(row.Cells, model.TableCell{
+					Row: rowIndex, Column: columnIndex, RowSpan: rowSpan, ColSpan: columnSpan,
+					Bounds: bounds, Text: text, Runs: runs,
+				})
+			}
+			columnIndex++
+		}
+		table.Rows = append(table.Rows, row)
+	}
+	return table, len(table.Rows) > 0
+}
+
+func positiveInt(value string) int {
+	n, _ := strconv.Atoi(value)
+	if n < 1 {
+		return 1
+	}
+	return n
+}
+
+func xmlBool(value string) bool {
+	return value == "1" || strings.EqualFold(value, "true")
+}
+
+func scaledOffsets(sizes []float64, target float64) []float64 {
+	offsets := make([]float64, len(sizes)+1)
+	var total float64
+	for _, size := range sizes {
+		total += size
+	}
+	scale := 1.0
+	if total > 0 && target > 0 {
+		scale = target / total
+	}
+	for i, size := range sizes {
+		offsets[i+1] = offsets[i] + size*scale
+	}
+	return offsets
+}
+
+func tableCellBounds(table model.Rect, columns, rows []float64, column, row, columnSpan, rowSpan int) model.Rect {
+	if column < 0 || row < 0 || column >= len(columns)-1 || row >= len(rows)-1 {
+		return model.Rect{}
+	}
+	columnEnd := column + columnSpan
+	if columnEnd >= len(columns) {
+		columnEnd = len(columns) - 1
+	}
+	rowEnd := row + rowSpan
+	if rowEnd >= len(rows) {
+		rowEnd = len(rows) - 1
+	}
+	return model.Rect{
+		X: table.X + columns[column], Y: table.Y + rows[row],
+		Width: columns[columnEnd] - columns[column], Height: rows[rowEnd] - rows[row],
 	}
 }
 

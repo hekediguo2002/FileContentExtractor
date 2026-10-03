@@ -5,7 +5,6 @@ import (
 	"path/filepath"
 	"strings"
 	"unicode"
-	"unicode/utf8"
 
 	"github.com/hekediguo2002/FileContentExtractor/doc"
 	"github.com/hekediguo2002/FileContentExtractor/docx"
@@ -140,36 +139,25 @@ func protectTableLineBreaks(text string, tables []Table) (string, string) {
 }
 
 func normalizeRuns(runs []TextRun) {
+	var joined []rune
+	lengths := make([]int, len(runs))
 	for i := range runs {
-		prev := previousNonSpaceRune(runs, i)
-		next := nextNonSpaceRune(runs, i)
-		runs[i].Text = normalizeChineseSpacesWithContext(runs[i].Text, prev, next)
+		text := []rune(runs[i].Text)
+		lengths[i] = len(text)
+		joined = append(joined, text...)
 	}
-}
-
-func previousNonSpaceRune(runs []TextRun, before int) rune {
-	for i := before - 1; i >= 0; i-- {
-		text := runs[i].Text
-		for len(text) > 0 {
-			r, size := utf8.DecodeLastRuneInString(text)
-			if !unicode.IsSpace(r) {
-				return r
-			}
-			text = text[:len(text)-size]
-		}
-	}
-	return 0
-}
-
-func nextNonSpaceRune(runs []TextRun, after int) rune {
-	for i := after + 1; i < len(runs); i++ {
-		for _, r := range runs[i].Text {
-			if !unicode.IsSpace(r) {
-				return r
+	remove := chineseWhitespaceDeletionMask(joined, 0, 0, false)
+	offset := 0
+	for i := range runs {
+		var text strings.Builder
+		for index, r := range joined[offset : offset+lengths[i]] {
+			if !remove[offset+index] {
+				text.WriteRune(r)
 			}
 		}
+		runs[i].Text = text.String()
+		offset += lengths[i]
 	}
-	return 0
 }
 
 func normalizeChineseSpaces(s string) string {
@@ -186,34 +174,211 @@ func normalizeChinesePageWhitespace(s string) string {
 
 func normalizeChineseWhitespaceWithContext(s string, before, after rune, preserveTSVRows bool) string {
 	runes := []rune(s)
+	remove := chineseWhitespaceDeletionMask(runes, before, after, preserveTSVRows)
 	var out strings.Builder
 	for i, r := range runes {
-		isRemovable := r == ' ' || r == '\u00a0' || r == '\u3000' || r == '\r' || r == '\n'
-		if !isRemovable {
-			out.WriteRune(r)
-			continue
-		}
-		left := before
-		for j := i - 1; j >= 0; j-- {
-			if !unicode.IsSpace(runes[j]) {
-				left = runes[j]
-				break
-			}
-		}
-		right := after
-		for j := i + 1; j < len(runes); j++ {
-			if !unicode.IsSpace(runes[j]) {
-				right = runes[j]
-				break
-			}
-		}
-		if isChineseTextRune(left) && isChineseTextRune(right) &&
-			!(preserveTSVRows && (r == '\r' || r == '\n') && isTSVRowBreak(runes, i)) {
+		if remove[i] {
 			continue
 		}
 		out.WriteRune(r)
 	}
 	return out.String()
+}
+
+func chineseWhitespaceDeletionMask(runes []rune, before, after rune, preserveTSVRows bool) []bool {
+	remove := make([]bool, len(runes))
+	leftRunes := make([]rune, len(runes))
+	leftIndexes := make([]int, len(runes))
+	lastRune, lastIndex := before, -1
+	for i, r := range runes {
+		leftRunes[i], leftIndexes[i] = lastRune, lastIndex
+		if !unicode.IsSpace(r) {
+			lastRune, lastIndex = r, i
+		}
+	}
+	rightRunes := make([]rune, len(runes))
+	nextRune := after
+	for i := len(runes) - 1; i >= 0; i-- {
+		rightRunes[i] = nextRune
+		if !unicode.IsSpace(runes[i]) {
+			nextRune = runes[i]
+		}
+	}
+	markSpacedArabicYearWhitespace(runes, before, preserveTSVRows, remove)
+	markSpacedChineseDateComponentWhitespace(runes, preserveTSVRows, remove)
+	for i, r := range runes {
+		if remove[i] || !isDateLayoutWhitespace(r) {
+			continue
+		}
+		left, right := leftRunes[i], rightRunes[i]
+		genericWhitespace := r != '\t'
+		dateWhitespace := isChineseDateBoundary(left, right) ||
+			isChineseDateRangeBoundary(left, right, leftIndexes[i], leftRunes, leftIndexes, before)
+		shouldRemove := genericWhitespace && isChineseTextRune(left) && isChineseTextRune(right) || dateWhitespace
+		structuralTSVWhitespace := preserveTSVRows && (r == '\t' || (r == '\r' || r == '\n') && isTSVRowBreak(runes, i))
+		if shouldRemove && !structuralTSVWhitespace {
+			remove[i] = true
+		}
+	}
+	return remove
+}
+
+func markSpacedArabicYearWhitespace(runes []rune, before rune, preserveTSVRows bool, remove []bool) {
+	previous := before
+	for start := 0; start < len(runes); {
+		if preserveTSVRows && (runes[start] == '\r' || runes[start] == '\n') && isTSVRowBreak(runes, start) {
+			previous = 0
+			start++
+			continue
+		}
+		if !isASCIIDigit(runes[start]) {
+			if !isDateLayoutWhitespace(runes[start]) {
+				previous = runes[start]
+			}
+			start++
+			continue
+		}
+		if isASCIIDigit(previous) {
+			previous = runes[start]
+			start++
+			continue
+		}
+		var digits [4]rune
+		digitCount := 0
+		var whitespace []int
+		end := start
+		lastDigit := rune(0)
+		for end < len(runes) {
+			switch {
+			case isASCIIDigit(runes[end]):
+				lastDigit = runes[end]
+				if digitCount >= len(digits) {
+					digitCount++
+					end++
+					continue
+				}
+				digits[digitCount] = runes[end]
+				digitCount++
+			case isDateLayoutWhitespace(runes[end]):
+				if preserveTSVRows && (runes[end] == '\r' || runes[end] == '\n') && isTSVRowBreak(runes, end) {
+					goto validate
+				}
+				whitespace = append(whitespace, end)
+			default:
+				goto validate
+			}
+			end++
+		}
+	validate:
+		if digitCount == len(digits) && end < len(runes) && runes[end] == '年' {
+			year := 0
+			for _, digit := range digits {
+				year = year*10 + int(digit-'0')
+			}
+			if year >= 1000 && year <= 2999 {
+				for _, index := range whitespace {
+					remove[index] = true
+				}
+			}
+		}
+		previous = lastDigit
+		start = end
+	}
+}
+
+func markSpacedChineseDateComponentWhitespace(runes []rune, preserveTSVRows bool, remove []bool) {
+	for start := 0; start < len(runes); {
+		if !isASCIIDigit(runes[start]) {
+			start++
+			continue
+		}
+		var digits [2]rune
+		digitCount := 0
+		var whitespace []int
+		end := start
+		for end < len(runes) {
+			switch {
+			case isASCIIDigit(runes[end]):
+				if digitCount < len(digits) {
+					digits[digitCount] = runes[end]
+				}
+				digitCount++
+			case isDateComponentWhitespace(runes[end]):
+				if preserveTSVRows && (runes[end] == '\r' || runes[end] == '\n') && isTSVRowBreak(runes, end) {
+					goto validate
+				}
+				whitespace = append(whitespace, end)
+			default:
+				goto validate
+			}
+			end++
+		}
+	validate:
+		if digitCount > 0 && digitCount <= len(digits) && end < len(runes) {
+			value := 0
+			for i := 0; i < digitCount; i++ {
+				value = value*10 + int(digits[i]-'0')
+			}
+			valid := runes[end] == '月' && value >= 1 && value <= 12 ||
+				runes[end] == '日' && value >= 1 && value <= 31
+			if valid {
+				for _, index := range whitespace {
+					remove[index] = true
+				}
+			}
+		}
+		start = end
+	}
+}
+
+func isChineseDateBoundary(left, right rune) bool {
+	return unicode.IsDigit(left) && strings.ContainsRune("年月日", right) ||
+		strings.ContainsRune("年月", left) && unicode.IsDigit(right)
+}
+
+func isChineseDateRangeBoundary(left, right rune, leftIndex int, leftRunes []rune, leftIndexes []int, before rune) bool {
+	if strings.ContainsRune("年月日", left) && isDateRangeConnector(right) {
+		return true
+	}
+	if unicode.IsDigit(left) && isDateRangeConnector(right) {
+		previous := before
+		if leftIndex >= 0 {
+			previous = leftRunes[leftIndex]
+		}
+		return strings.ContainsRune("年月日", previous)
+	}
+	if !isDateRangeConnector(left) || !unicode.IsDigit(right) {
+		return false
+	}
+	previousIndex := -1
+	previous := before
+	if leftIndex >= 0 {
+		previous = leftRunes[leftIndex]
+		previousIndex = leftIndexes[leftIndex]
+	}
+	if strings.ContainsRune("年月日", previous) {
+		return true
+	}
+	if !unicode.IsDigit(previous) || previousIndex < 0 {
+		return false
+	}
+	return strings.ContainsRune("年月日", leftRunes[previousIndex])
+}
+
+func isDateRangeConnector(r rune) bool {
+	return strings.ContainsRune("-－–—~～至", r)
+}
+
+func isDateLayoutWhitespace(r rune) bool {
+	return r == ' ' || r == '\t' || r == '\u00a0' || r == '\u3000' || r == '\r' || r == '\n'
+}
+
+func isDateComponentWhitespace(r rune) bool {
+	return r == ' ' || r == '\u00a0' || r == '\u3000' || r == '\r' || r == '\n'
+}
+
+func isASCIIDigit(r rune) bool {
+	return r >= '0' && r <= '9'
 }
 
 func isTSVRowBreak(runes []rune, index int) bool {

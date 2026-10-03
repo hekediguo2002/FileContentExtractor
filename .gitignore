@@ -10,3 +10,4 @@ coverage.out
 testfile/*/
 
 cmd/extract/test
+cmd/extract/ocr_runtime

@@ -4,9 +4,9 @@
 
 通过 `Open`/`Read` 返回的所有格式都会清理汉字及中文标点之间由 OCR 或排版产生的多余空格和软换行，例如 `关 于`、`关\n于` 都会规范为 `关于`；中文日期中的空白也会清理，例如 `2022 年 1 月 21 日`、`2017 年 4 月\n24 日` 会分别规范为 `2022年1月21日`、`2017年4月24日`。被空格、制表符或软换行拆开的四位年份也会在紧邻 `年` 时合并，例如 `2\t0\t26年`、`2 0 2 6 年 9 月` 会规范为 `2026年`、`2026年9月`；有效的月份、日期及年月区间同样会处理，例如 `2026年9月2 9日`、`2026年1 - 3月` 会规范为 `2026年9月29日`、`2026年1-3月`。英文单词之间的空格、英文换行以及普通 TSV 表格的单元格和行边界保持不变。DOC、DOCX 和带网格线的 PDF 表格还会按最小单元格返回结构化内容。
 
-项目使用 Go 1.20，零第三方依赖，不需要安装 Office 或其他运行时组件。
+项目使用 Go 1.20。默认关闭 OCR 时不需要 Office、ONNX Runtime 或其他运行时组件；可选 PaddleOCR 功能使用动态加载的 ONNX Runtime，未开启时不会加载或依赖其 DLL/DYLIB。
 
-> 这是面向“内容提取”的只读解析器，不是完整的 Word、PDF 或 PowerPoint 排版引擎，也不执行 OCR。复杂排版的自动分页结果可能与原软件显示不同。
+> 这是面向“内容提取”的只读解析器，不是完整的 Word、PDF 或 PowerPoint 排版引擎。默认不执行 OCR；只有调用 OCR API 或通过 `OpenWithOptions` 显式开启时才执行。复杂排版的自动分页结果可能与原软件显示不同。
 
 ## 支持的格式
 
@@ -60,6 +60,93 @@ func main() {
 }
 ```
 
+## 可选 PaddleOCR
+
+OCR 默认关闭，原有 `Open` 行为不变。准备 PP-OCRv4 ONNX 模型和对应平台的 ONNX Runtime 后，可以识别单张图片：
+
+```go
+config := fce.OCRConfig{
+    RuntimePath: "/path/to/libonnxruntime.dylib", // Windows 为 onnxruntime.dll
+    ModelDir:    "/path/to/ocr_models",
+}
+text, err := fce.ImageToText("scan.png", config)
+```
+
+或者对文档解析器已经提取出的页面图片启用 OCR：
+
+```go
+document, err := fce.OpenWithOptions("scan.pdf", fce.Options{
+    OCR: fce.OCRConfig{
+        Enabled:     true,
+        RuntimePath: "/path/to/libonnxruntime.dylib",
+        ModelDir:    "/path/to/ocr_models",
+    },
+})
+```
+
+`ImageToText` 和文档 OCR 都会执行与普通文档相同的中文空格、软换行和日期归一化。PDF、DOC、DOCX、PPT、PPTX 使用同一套页面级 OCR 兜底流程：原生解析得到至少 16 个有效字母或数字时不执行 OCR；原生文字为空或明显过少时，只有 `OCR.Enabled=true` 才识别页面扫描图。页码横线、空白和标点不计入阈值。其他能够提取页面图片的格式也复用该统一流程。OCR 文字作为 `TextRun` 返回，`Font` 为 `OCR`，位置由图片像素坐标映射到页面坐标，字号为文字框高度估算值，颜色由文字框中的前景像素估算。
+
+检测、缩放、BGR/CHW 归一化、DB 连通区域、可选 2x2 膨胀、阅读顺序和颜色估计均为纯 Go 实现，不依赖 OpenCV。识别支持按宽高比分组批处理，文档支持页面并发；CPU 实测中 ONNX Runtime 自身已经并行，批大小和页面并发默认都为 1，避免线程过量竞争。可通过 `RecognitionBatchSize` 和 `PageWorkers` 显式调优。`EnableOrientationClassification` 可按需加载第三个模型，纠正置信度达到阈值的 180 度文字框；默认关闭，不影响原有模型部署。
+
+### 下载 OCR 资源
+
+脚本会下载 PP-OCRv4 检测、识别、方向分类模型、字符字典以及当前平台的 ONNX Runtime，并校验所有文件的 SHA-256。方向分类模型会一起下载，但只有开启 `-ocr-cls=true` 时才加载。
+
+macOS 或 Windows 的 Git Bash/MSYS2 中执行：
+
+```bash
+./scripts/download_ocr_assets.sh ./ocr_runtime
+```
+
+不传目录时也默认写入 `./ocr_runtime`。脚本需要 `curl` 或 `wget`、`shasum` 或 `sha256sum`；Windows 还需要 `unzip`。下载后的主要目录为：
+
+```text
+ocr_runtime/
+├── models/             PP-OCRv4 ONNX 模型和字符字典
+└── runtime/
+    ├── lib/            macOS ONNX Runtime
+    └── x64/            Windows 7 x64 ONNX Runtime 及其依赖 DLL
+```
+
+macOS 12.7.6：
+
+```bash
+go run ./cmd/extract \
+  -ocr=true \
+  -onnxruntime ./ocr_runtime/runtime/lib/libonnxruntime.1.19.2.dylib \
+  -ocr-model-dir ./ocr_runtime/models \
+  scan.pdf
+```
+
+Windows 7 x64（Git Bash）：
+
+```bash
+./extract.exe \
+  -ocr=true \
+  -onnxruntime ./ocr_runtime/runtime/x64/onnxruntime.dll \
+  -ocr-model-dir ./ocr_runtime/models \
+  scan.pdf
+```
+
+Windows 运行时必须保留 `ocr_runtime/runtime/x64` 中的全部 DLL；部署时可以把这些 DLL 一起复制到 `extract.exe` 同级目录，并相应调整 `-onnxruntime` 路径。也可以通过环境变量设置路径：
+
+```bash
+export FCE_ONNXRUNTIME_PATH="$PWD/ocr_runtime/runtime/lib/libonnxruntime.1.19.2.dylib"
+export FCE_PADDLEOCR_MODEL_DIR="$PWD/ocr_runtime/models"
+go run ./cmd/extract -ocr=true scan.pdf
+```
+
+模型名称、校验值以及 Windows 7/macOS 12.7.6 的详细兼容说明见 [ocr/README.md](ocr/README.md)。测试命令也支持：
+
+```bash
+go run ./cmd/extract -ocr=true \
+  -onnxruntime /path/to/libonnxruntime.dylib \
+  -ocr-model-dir /path/to/ocr_models \
+  scan.pdf
+```
+
+需要方向分类或调优时可增加 `-ocr-cls`、`-ocr-cls-threshold`、`-ocr-batch-size`、`-ocr-workers` 和 `-ocr-dilation`。布尔参数推荐写成 `-ocr=true`、`-ocr-cls=true`，不要把 `true` 写成独立的位置参数。
+
 `fce.Read` 是 `fce.Open` 的别名；`fce.MustRead` 在出错时 panic（按调用方需要选用）。
 
 ## Demo
@@ -86,6 +173,7 @@ go run ./cmd/extract demo.docx   # 也支持单个文件
 - `ppt/`：OLE2 PowerPoint 记录、幻灯片文字原子和 OfficeArt 图片
 - `rtf/`：RTF 控制字、字体表、颜色表和 `\uN` Unicode 转义解析
 - `ofd/`：OFD（GB/T 33190）包结构、公共资源和页面对象解析
+- `ocr/`：可选 PaddleOCR ONNX 检测、识别、坐标和阅读顺序处理
 - `internal/ole/`：OLE2/CFB 复合文档读取（扇区链、MiniFAT、目录条目）
 - `internal/officeart/`：OfficeArt BLIP 图片扫描（jpg/png/dib/tiff）
 - `cmd/extract/`：批量提取文字和图片的 demo 命令行
@@ -142,7 +230,7 @@ type Image struct {
 }
 ```
 
-图片的 `Data` 是文件中提取出的原始或解压后数据。JPEG/PNG 等自描述格式可直接保存；PDF Flate 原始像素流会尽量合成为 PNG，`DeviceRGB`、`DeviceGray`、`DeviceCMYK` 以及可确定通道数的 `ICCBased` 色彩空间均可参与转换，无法合成时仍是需按 ColorSpace/DecodeParms 封装的原始数据。扫描型 PDF 如果没有文字层，页面文字会为空，但仍会返回可提取的页面图片；项目不内置 OCR，不能从图片中识别文字。
+图片的 `Data` 是文件中提取出的原始或解压后数据。JPEG/PNG 等自描述格式可直接保存；PDF Flate 原始像素流会尽量合成为 PNG，`DeviceRGB`、`DeviceGray`、`DeviceCMYK` 以及可确定通道数的 `ICCBased` 色彩空间均可参与转换，无法合成时仍是需按 ColorSpace/DecodeParms 封装的原始数据。扫描型 PDF 如果没有文字层，默认页面文字为空但仍返回页面图片；显式开启可选 PaddleOCR 后，可以从这些图片识别文字。
 
 ## 能力边界
 
@@ -175,6 +263,9 @@ XLS/XLSX 将每个工作表作为一个 `Page`，`Page.Name` 是工作表名称�
 ## 测试
 
 ```bash
+go test ./...
 go build ./...
 go vet ./...
 ```
+
+设置 `FCE_ONNXRUNTIME_PATH` 和 `FCE_PADDLEOCR_MODEL_DIR` 后，测试还会运行真实 PaddleOCR 样本回归。`scripts/compare_paddleocr.py` 使用 Python PaddleOCR 生成逐页对照结果，仅用于开发期自测。

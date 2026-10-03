@@ -13,6 +13,7 @@
 package main
 
 import (
+	"flag"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -25,9 +26,30 @@ import (
 var errUnsupported = fmt.Errorf("unsupported")
 
 func main() {
+	ocrEnabled := flag.Bool("ocr", false, "对提取出的页面图片运行 PaddleOCR ONNX")
+	runtimePath := flag.String("onnxruntime", "", "onnxruntime 动态库路径")
+	modelDir := flag.String("ocr-model-dir", "", "PaddleOCR ONNX 模型目录")
+	ocrWorkers := flag.Int("ocr-workers", 0, "OCR 页面并发数（0 使用 CPU 默认值 1）")
+	ocrBatchSize := flag.Int("ocr-batch-size", 0, "OCR 文字识别批大小（0 使用 CPU 默认值 1）")
+	ocrClassification := flag.Bool("ocr-cls", false, "启用可选的 0/180 度文字方向分类")
+	ocrClassifierModel := flag.String("ocr-cls-model", "", "PaddleOCR 方向分类 ONNX 模型路径")
+	ocrClassifierThreshold := flag.Float64("ocr-cls-threshold", 0, "方向分类旋转阈值（0 使用默认值 0.9）")
+	ocrDilation := flag.Bool("ocr-dilation", false, "启用 DB 检测结果 2x2 膨胀后处理")
+	flag.Parse()
+	options := fce.Options{OCR: fce.OCRConfig{
+		Enabled:                         *ocrEnabled,
+		RuntimePath:                     *runtimePath,
+		ModelDir:                        *modelDir,
+		PageWorkers:                     *ocrWorkers,
+		RecognitionBatchSize:            *ocrBatchSize,
+		EnableOrientationClassification: *ocrClassification,
+		ClassifierModelPath:             *ocrClassifierModel,
+		OrientationThreshold:            float32(*ocrClassifierThreshold),
+		EnableDetectionDilation:         *ocrDilation,
+	}}
 	target := "test"
-	if len(os.Args) > 1 {
-		target = os.Args[1]
+	if flag.NArg() > 0 {
+		target = flag.Arg(0)
 	}
 	info, err := os.Stat(target)
 	if err != nil {
@@ -63,7 +85,7 @@ func main() {
 
 	extracted, failed, skipped := 0, 0, 0
 	for _, path := range files {
-		switch err := extract(path); {
+		switch err := extract(path, options); {
 		case err == nil:
 			extracted++
 		case err == errUnsupported:
@@ -77,9 +99,9 @@ func main() {
 
 // extract 提取单个文件的文字和图片到同名子目录并打印耗时。
 // 不支持的格式返回 errUnsupported，其余错误正常返回，绝不 panic。
-func extract(path string) error {
+func extract(path string, options fce.Options) error {
 	start := time.Now()
-	doc, err := fce.Open(path)
+	doc, err := fce.OpenWithOptions(path, options)
 	if err != nil {
 		if strings.Contains(err.Error(), "unsupported file format") {
 			fmt.Printf("跳过 %s: %v\n", path, err)

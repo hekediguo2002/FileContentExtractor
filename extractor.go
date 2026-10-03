@@ -4,11 +4,13 @@ import (
 	"fmt"
 	"path/filepath"
 	"strings"
+	"sync"
 	"unicode"
 
 	"github.com/hekediguo2002/FileContentExtractor/doc"
 	"github.com/hekediguo2002/FileContentExtractor/docx"
 	"github.com/hekediguo2002/FileContentExtractor/model"
+	paddleocr "github.com/hekediguo2002/FileContentExtractor/ocr"
 	"github.com/hekediguo2002/FileContentExtractor/ofd"
 	"github.com/hekediguo2002/FileContentExtractor/pdf"
 	"github.com/hekediguo2002/FileContentExtractor/ppt"
@@ -26,6 +28,12 @@ type TableRow = model.TableRow
 type Table = model.Table
 type Page = model.Page
 type Document = model.Document
+type OCRConfig = paddleocr.Config
+
+// Options controls optional extraction features. OCR is disabled by default.
+type Options struct {
+	OCR OCRConfig
+}
 
 // TableTSV converts a structured table into one tab-separated line per row.
 // Layout-only line breaks inside cells are removed; TableCell.Text is unchanged.
@@ -34,6 +42,13 @@ func TableTSV(table Table) string { return model.TableTSV(table) }
 // Open 按扩展名选择解析器并提取文档内容。文档损坏或格式畸形时返回 error；
 // 解析器内部的意外 panic 也会被 recover 并转换为 error，不会导致程序崩溃。
 func Open(path string) (d *Document, err error) {
+	return OpenWithOptions(path, Options{})
+}
+
+// OpenWithOptions extracts a document and optionally recognizes text from its
+// extracted images. ONNX Runtime is loaded only when options.OCR.Enabled is
+// true and an image actually needs recognition.
+func OpenWithOptions(path string, options Options) (d *Document, err error) {
 	defer func() {
 		if r := recover(); r != nil {
 			d, err = nil, fmt.Errorf("parse %s: internal panic: %v", path, r)
@@ -65,6 +80,11 @@ func Open(path string) (d *Document, err error) {
 	if err != nil || d == nil {
 		return d, err
 	}
+	if options.OCR.Enabled {
+		if err := applyDocumentOCR(d, options.OCR); err != nil {
+			return nil, fmt.Errorf("OCR %s: %w", path, err)
+		}
+	}
 	normalizeDocumentText(d)
 	return d, nil
 }
@@ -77,6 +97,159 @@ func MustRead(path string) *Document {
 		panic(err)
 	}
 	return d
+}
+
+// ImageToText recognizes an image file with PaddleOCR ONNX and applies the
+// same Chinese whitespace and date normalization used by document extraction.
+func ImageToText(path string, config OCRConfig) (string, error) {
+	result, err := paddleocr.ImageToText(path, config)
+	if err != nil {
+		return "", err
+	}
+	return normalizeChinesePageWhitespace(result.Text), nil
+}
+
+// ImageBytesToText is ImageToText for encoded PNG, JPEG, or GIF data.
+func ImageBytesToText(data []byte, config OCRConfig) (string, error) {
+	result, err := paddleocr.ImageBytesToText(data, config)
+	if err != nil {
+		return "", err
+	}
+	return normalizeChinesePageWhitespace(result.Text), nil
+}
+
+func applyDocumentOCR(document *Document, config OCRConfig) error {
+	workers := config.PageWorkers
+	if workers <= 0 {
+		workers = 1
+	}
+	if workers > len(document.Pages) {
+		workers = len(document.Pages)
+	}
+	if workers < 1 {
+		workers = 1
+	}
+	jobs := make(chan int)
+	errorsByPage := make([]error, len(document.Pages))
+	var wait sync.WaitGroup
+	for worker := 0; worker < workers; worker++ {
+		wait.Add(1)
+		go func() {
+			defer wait.Done()
+			for pageIndex := range jobs {
+				errorsByPage[pageIndex] = applyPageOCR(&document.Pages[pageIndex], config)
+			}
+		}()
+	}
+	for pageIndex := range document.Pages {
+		jobs <- pageIndex
+	}
+	close(jobs)
+	wait.Wait()
+	for _, err := range errorsByPage {
+		if err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func applyPageOCR(page *Page, config OCRConfig) error {
+	if hasSufficientNativeText(page.Text) {
+		return nil
+	}
+	images := ocrCandidateImages(page.Images)
+	for _, image := range images {
+		result, err := paddleocr.ImageBytesToText(image.Data, config)
+		if err != nil {
+			return fmt.Errorf("page %d image %q: %w", page.Number, image.Name, err)
+		}
+		if strings.TrimSpace(result.Text) == "" {
+			continue
+		}
+		if page.Text != "" && !strings.HasSuffix(page.Text, "\n") {
+			page.Text += "\n"
+		}
+		page.Text += result.Text
+		bounds := image.Bounds
+		if bounds.Width <= 0 {
+			bounds.Width = page.Width
+		}
+		if bounds.Height <= 0 {
+			bounds.Height = page.Height
+		}
+		if bounds.Width <= 0 {
+			bounds.Width = float64(image.Width)
+		}
+		if bounds.Height <= 0 {
+			bounds.Height = float64(image.Height)
+		}
+		scaleX := bounds.Width / float64(image.Width)
+		scaleY := bounds.Height / float64(image.Height)
+		for _, line := range result.Lines {
+			color := line.Color
+			if color == "" {
+				color = "#000000"
+			}
+			lineBounds := Rect{
+				X:      bounds.X + line.Bounds.X*scaleX,
+				Y:      bounds.Y + line.Bounds.Y*scaleY,
+				Width:  line.Bounds.Width * scaleX,
+				Height: line.Bounds.Height * scaleY,
+			}
+			page.Runs = append(page.Runs, TextRun{
+				Text: line.Text, Bounds: lineBounds, Font: "OCR",
+				Size: lineBounds.Height * 0.75, Color: color,
+			})
+		}
+	}
+	return nil
+}
+
+const minimumNativeTextCharacters = 16
+
+// hasSufficientNativeText ignores whitespace and punctuation so that a page
+// number or watermark does not prevent OCR of an otherwise scanned page.
+func hasSufficientNativeText(text string) bool {
+	characters := 0
+	for _, value := range text {
+		if !unicode.IsLetter(value) && !unicode.IsNumber(value) {
+			continue
+		}
+		characters++
+		if characters >= minimumNativeTextCharacters {
+			return true
+		}
+	}
+	return false
+}
+
+func ocrCandidateImages(images []Image) []Image {
+	if len(images) == 0 {
+		return nil
+	}
+	largestIndex := -1
+	var largestArea int64
+	for index, image := range images {
+		area := int64(image.Width) * int64(image.Height)
+		if image.Width >= 64 && image.Height >= 32 && len(image.Data) > 0 && area > largestArea {
+			largestIndex, largestArea = index, area
+		}
+	}
+	if largestIndex < 0 {
+		return nil
+	}
+	largest := images[largestIndex]
+	if largest.Width >= 512 && largest.Height >= 512 {
+		return []Image{largest}
+	}
+	result := make([]Image, 0, len(images))
+	for _, image := range images {
+		if image.Width >= 64 && image.Height >= 32 && len(image.Data) > 0 {
+			result = append(result, image)
+		}
+	}
+	return result
 }
 
 // normalizeDocumentText removes layout/OCR whitespace inserted between Chinese

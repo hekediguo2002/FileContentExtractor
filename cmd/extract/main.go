@@ -1,9 +1,10 @@
-// 提取文档文字和图片的 demo。
+// 提取文档文字和图片、对 PNG/JPG 图片执行 OCR 的 demo。
 //
 // 遍历指定目录（或单个文件），把每个文档的逐页文字和图片输出到同名子目录：
 //
 //	test/中文.docx -> test/中文/page_1.txt, test/中文/page_2.txt,
 //	                  test/中文/image_1.png, ...
+//	test/扫描件.png  -> test/扫描件/page_1.txt（需要 -ocr=true）
 //
 // 用法:
 //
@@ -23,7 +24,10 @@ import (
 	fce "github.com/hekediguo2002/FileContentExtractor"
 )
 
-var errUnsupported = fmt.Errorf("unsupported")
+var (
+	errUnsupported = fmt.Errorf("unsupported")
+	errOCRDisabled = fmt.Errorf("OCR disabled")
+)
 
 func main() {
 	ocrEnabled := flag.Bool("ocr", false, "对提取出的页面图片运行 PaddleOCR ONNX")
@@ -88,19 +92,22 @@ func main() {
 		switch err := extract(path, options); {
 		case err == nil:
 			extracted++
-		case err == errUnsupported:
+		case err == errUnsupported || err == errOCRDisabled:
 			skipped++
 		default:
 			failed++
 		}
 	}
-	fmt.Printf("完成: 提取 %d，失败 %d，跳过(不支持的格式) %d\n", extracted, failed, skipped)
+	fmt.Printf("完成: 提取 %d，失败 %d，跳过 %d\n", extracted, failed, skipped)
 }
 
 // extract 提取单个文件的文字和图片到同名子目录并打印耗时。
 // 不支持的格式返回 errUnsupported，其余错误正常返回，绝不 panic。
 func extract(path string, options fce.Options) error {
 	start := time.Now()
+	if isOCRImage(path) {
+		return extractOCRImage(path, options.OCR, start)
+	}
 	doc, err := fce.OpenWithOptions(path, options)
 	if err != nil {
 		if strings.Contains(err.Error(), "unsupported file format") {
@@ -159,6 +166,41 @@ func extract(path string, options fce.Options) error {
 	}
 	fmt.Printf("提取 %s -> %s (%d 页, %d 张图片, %d 个表格) 耗时: %s\n",
 		path, outDir, len(doc.Pages), imageCount, tableCount, time.Since(start).Round(time.Millisecond))
+	return nil
+}
+
+func isOCRImage(path string) bool {
+	switch strings.ToLower(filepath.Ext(path)) {
+	case ".png", ".jpg", ".jpeg":
+		return true
+	default:
+		return false
+	}
+}
+
+func extractOCRImage(path string, config fce.OCRConfig, start time.Time) error {
+	if !config.Enabled {
+		fmt.Printf("跳过 %s: PNG/JPG 文字识别需要 -ocr=true\n", path)
+		return errOCRDisabled
+	}
+	text, err := fce.ImageToText(path, config)
+	if err != nil {
+		fmt.Printf("失败 %s: %v (耗时 %s)\n", path, err, time.Since(start).Round(time.Millisecond))
+		return err
+	}
+	base := strings.TrimSuffix(filepath.Base(path), filepath.Ext(path))
+	outDir := filepath.Join(filepath.Dir(path), base)
+	if err := os.MkdirAll(outDir, 0o755); err != nil {
+		fmt.Printf("失败 %s: %v\n", path, err)
+		return err
+	}
+	textPath := filepath.Join(outDir, "page_1.txt")
+	if err := os.WriteFile(textPath, []byte(text), 0o644); err != nil {
+		fmt.Printf("失败 %s: 写 %s: %v\n", path, textPath, err)
+		return err
+	}
+	fmt.Printf("OCR %s -> %s (1 页) 耗时: %s\n",
+		path, outDir, time.Since(start).Round(time.Millisecond))
 	return nil
 }
 

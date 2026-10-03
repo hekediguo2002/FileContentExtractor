@@ -151,11 +151,15 @@ go run ./cmd/extract -ocr=true \
 
 ## Demo
 
-`cmd/extract` 是提取文字和图片的示例程序：遍历指定目录（或单个文件），把每个文档的逐页文字和图片写到同名子目录，解析失败的文件只打印错误并继续：
+`cmd/extract` 是提取文字和图片的示例程序：遍历指定目录（或单个文件），把每个文档的逐页文字和图片写到同名子目录，解析失败的文件只打印错误并继续。PNG、JPG、JPEG 可以作为独立输入，开启 OCR 后识别结果写入同名目录的 `page_1.txt`：
 
 ```bash
 go run ./cmd/extract testfile    # 缺省目录为 test，不存在时退回 testfile
 go run ./cmd/extract demo.docx   # 也支持单个文件
+go run ./cmd/extract -ocr=true \
+  -onnxruntime ./ocr_runtime/runtime/lib/libonnxruntime.1.19.2.dylib \
+  -ocr-model-dir ./ocr_runtime/models \
+  scan.png
 ```
 
 输出形如 `demo/page_1.txt`、`demo/page_1_table_1.tsv`、`demo/image_1.png`。表格 TSV 每行对应一个表格行、使用制表符分隔单元格，并合并单元格内部的排版换行；图片扩展名按魔数嗅探真实格式（png/jpg/gif/bmp/tiff），识别不出时使用提取器给出的格式。

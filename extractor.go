@@ -106,7 +106,7 @@ func ImageToText(path string, config OCRConfig) (string, error) {
 	if err != nil {
 		return "", err
 	}
-	return normalizeChinesePageWhitespace(result.Text), nil
+	return normalizeTargetedIdentifiers(normalizeChinesePageWhitespace(result.Text)), nil
 }
 
 // ImageBytesToText is ImageToText for encoded PNG, JPEG, or GIF data.
@@ -115,7 +115,7 @@ func ImageBytesToText(data []byte, config OCRConfig) (string, error) {
 	if err != nil {
 		return "", err
 	}
-	return normalizeChinesePageWhitespace(result.Text), nil
+	return normalizeTargetedIdentifiers(normalizeChinesePageWhitespace(result.Text)), nil
 }
 
 func applyDocumentOCR(document *Document, config OCRConfig) error {
@@ -260,12 +260,13 @@ func normalizeDocumentText(d *Document) {
 		protected, marker := protectTableLineBreaks(page.Text, page.Tables)
 		page.Text = normalizeChinesePageWhitespace(protected)
 		page.Text = strings.ReplaceAll(page.Text, marker, "\n")
+		page.Text = normalizeTargetedIdentifiers(page.Text)
 		normalizeRuns(page.Runs)
 		for tableIndex := range page.Tables {
 			for rowIndex := range page.Tables[tableIndex].Rows {
 				for cellIndex := range page.Tables[tableIndex].Rows[rowIndex].Cells {
 					cell := &page.Tables[tableIndex].Rows[rowIndex].Cells[cellIndex]
-					cell.Text = normalizeChineseSpaces(cell.Text)
+					cell.Text = normalizeTargetedIdentifiers(normalizeChineseSpaces(cell.Text))
 					normalizeRuns(cell.Runs)
 				}
 			}
@@ -328,9 +329,517 @@ func normalizeRuns(runs []TextRun) {
 				text.WriteRune(r)
 			}
 		}
-		runs[i].Text = text.String()
+		runs[i].Text = normalizeTargetedIdentifiers(text.String())
 		offset += lengths[i]
 	}
+}
+
+type identifierFieldKind uint8
+
+const (
+	identifierSecuritiesCode identifierFieldKind = iota + 1
+	identifierSecuritiesName
+	identifierAnnouncementCode
+)
+
+type identifierField struct {
+	name []rune
+	kind identifierFieldKind
+}
+
+var targetedIdentifierFields = []identifierField{
+	{name: []rune("证券代码"), kind: identifierSecuritiesCode},
+	{name: []rune("证券简称"), kind: identifierSecuritiesName},
+	{name: []rune("公告编号"), kind: identifierAnnouncementCode},
+}
+
+var stateCouncilOrderPrefix = []rune("国令第")
+var workdaySuffix = []rune("工作日")
+
+// normalizeTargetedIdentifiers compacts only explicitly recognized document
+// identifiers. It deliberately does not apply to generic labels such as
+// "编号", so ordinary number lists and TSV columns remain unchanged.
+func normalizeTargetedIdentifiers(text string) string {
+	hasSectionPrefix := strings.ContainsRune(text, '第')
+	hasPageReference := hasSectionPrefix && strings.Contains(text, "页共")
+	hasArticleReference := hasSectionPrefix &&
+		strings.ContainsRune(text, '.') && strings.ContainsRune(text, '条')
+	hasStateCouncilOrder := hasSectionPrefix && strings.Contains(text, "国令第")
+	hasOrdinalNumber := hasSectionPrefix && strings.ContainsRune(text, '号')
+	hasSecuritiesField := strings.Contains(text, "证券")
+	hasAnnouncementCode := strings.Contains(text, "公告编号")
+	hasBracketedYear := strings.ContainsRune(text, '〔')
+	if !hasSecuritiesField && !hasAnnouncementCode && !hasBracketedYear &&
+		!hasPageReference && !hasArticleReference && !hasStateCouncilOrder &&
+		!hasOrdinalNumber {
+		return text
+	}
+	runes := []rune(text)
+	out := make([]rune, 0, len(runes))
+	seenFieldOnLine := false
+	for index := 0; index < len(runes); {
+		if runes[index] == '\n' || runes[index] == '\r' || runes[index] == '\t' {
+			out = append(out, runes[index])
+			seenFieldOnLine = false
+			index++
+			continue
+		}
+		if runes[index] == '〔' {
+			if year, end, ok := compactBracketedYear(runes, index); ok {
+				out = append(out, '〔')
+				out = append(out, year...)
+				out = append(out, '〕')
+				if number, numberEnd, valid := compactOfficialDocumentNumber(runes, end); valid {
+					out = append(out, number...)
+					index = numberEnd
+				} else {
+					index = end
+				}
+				continue
+			}
+		}
+		if runes[index] == '第' {
+			if hasPageReference {
+				if reference, end, ok := compactPageReference(runes, index); ok {
+					out = append(out, reference...)
+					index = end
+					continue
+				}
+			}
+			if hasArticleReference {
+				if reference, end, ok := compactArticleReference(runes, index); ok {
+					out = append(out, reference...)
+					index = end
+					continue
+				}
+			}
+			if hasOrdinalNumber {
+				if number, end, ok := compactOrdinalNumber(runes, index); ok {
+					out = append(out, number...)
+					index = end
+					continue
+				}
+			}
+		}
+		if hasStateCouncilOrder && runes[index] == '国' {
+			if order, end, ok := compactStateCouncilOrder(runes, index); ok {
+				out = append(out, order...)
+				index = end
+				continue
+			}
+		}
+		field, labelEnd, ok := matchTargetedIdentifierField(runes, index)
+		if !ok {
+			out = append(out, runes[index])
+			index++
+			continue
+		}
+		if seenFieldOnLine && len(out) > 0 && !unicode.IsSpace(out[len(out)-1]) {
+			out = append(out, ' ')
+		}
+		out = append(out, runes[index:labelEnd]...)
+		index = labelEnd
+		switch field.kind {
+		case identifierSecuritiesCode:
+			if token, end, valid := compactIdentifierToken(runes, index, identifierSecuritiesCode); valid {
+				out = append(out, token...)
+				index = end
+			}
+		case identifierAnnouncementCode:
+			if token, end, valid := compactIdentifierToken(runes, index, identifierAnnouncementCode); valid {
+				out = append(out, token...)
+				index = end
+			}
+		case identifierSecuritiesName:
+			if token, end, valid := compactSecuritiesNamePrefix(runes, index); valid {
+				out = append(out, token...)
+				index = end
+			}
+		}
+		seenFieldOnLine = true
+	}
+	return string(out)
+}
+
+func matchTargetedIdentifierField(runes []rune, start int) (identifierField, int, bool) {
+	for _, field := range targetedIdentifierFields {
+		end := start + len(field.name)
+		if end >= len(runes) || !runesEqual(runes[start:end], field.name) {
+			continue
+		}
+		if runes[end] != '：' && runes[end] != ':' {
+			continue
+		}
+		return field, end + 1, true
+	}
+	return identifierField{}, start, false
+}
+
+func compactIdentifierToken(runes []rune, start int, kind identifierFieldKind) ([]rune, int, bool) {
+	index := start
+	for index < len(runes) && isInlineIdentifierSpace(runes[index]) {
+		index++
+	}
+	var token []rune
+	for index < len(runes) {
+		if normalized, ok := identifierTokenRune(runes[index], kind); ok {
+			token = append(token, normalized)
+			index++
+			continue
+		}
+		if !isInlineIdentifierSpace(runes[index]) {
+			break
+		}
+		next := index
+		for next < len(runes) && isInlineIdentifierSpace(runes[next]) {
+			next++
+		}
+		if next >= len(runes) {
+			break
+		}
+		if _, ok := identifierTokenRune(runes[next], kind); !ok {
+			break
+		}
+		index = next
+	}
+	if kind == identifierSecuritiesCode {
+		if len(token) != 6 || !allASCIIDigits(token) {
+			return nil, start, false
+		}
+	} else if !validAnnouncementCode(token) {
+		return nil, start, false
+	}
+	return token, index, true
+}
+
+func compactSecuritiesNamePrefix(runes []rune, start int) ([]rune, int, bool) {
+	index := start
+	for index < len(runes) && isInlineIdentifierSpace(runes[index]) {
+		index++
+	}
+	var prefix []rune
+	for index < len(runes) {
+		if isSecuritiesNamePrefixRune(runes[index]) {
+			prefix = append(prefix, runes[index])
+			index++
+			continue
+		}
+		if !isInlineIdentifierSpace(runes[index]) {
+			break
+		}
+		next := index
+		for next < len(runes) && isInlineIdentifierSpace(runes[next]) {
+			next++
+		}
+		if next < len(runes) && isSecuritiesNamePrefixRune(runes[next]) {
+			index = next
+			continue
+		}
+		if next < len(runes) && len(prefix) > 0 && unicode.Is(unicode.Han, runes[next]) {
+			index = next
+		}
+		break
+	}
+	if len(prefix) == 0 {
+		return nil, start, false
+	}
+	return prefix, index, true
+}
+
+func compactBracketedYear(runes []rune, start int) ([]rune, int, bool) {
+	var digits []rune
+	index := start + 1
+	for index < len(runes) && runes[index] != '〕' {
+		if index-start > 32 || runes[index] == '\r' || runes[index] == '\n' || runes[index] == '\t' {
+			return nil, start, false
+		}
+		if isASCIIDigit(runes[index]) {
+			digits = append(digits, runes[index])
+		} else if !isInlineIdentifierSpace(runes[index]) {
+			return nil, start, false
+		}
+		index++
+	}
+	if index >= len(runes) || len(digits) != 4 {
+		return nil, start, false
+	}
+	year := 0
+	for _, digit := range digits {
+		year = year*10 + int(digit-'0')
+	}
+	if year < 1000 || year > 2999 {
+		return nil, start, false
+	}
+	return digits, index + 1, true
+}
+
+func compactOfficialDocumentNumber(runes []rune, start int) ([]rune, int, bool) {
+	index := start
+	for index < len(runes) && isInlineIdentifierSpace(runes[index]) {
+		index++
+	}
+	var digits []rune
+	for index < len(runes) {
+		if isASCIIDigit(runes[index]) {
+			if len(digits) == 6 {
+				return nil, start, false
+			}
+			digits = append(digits, runes[index])
+			index++
+			continue
+		}
+		if !isInlineIdentifierSpace(runes[index]) {
+			break
+		}
+		for index < len(runes) && isInlineIdentifierSpace(runes[index]) {
+			index++
+		}
+		if index >= len(runes) || (!isASCIIDigit(runes[index]) && runes[index] != '号') {
+			return nil, start, false
+		}
+	}
+	if len(digits) == 0 || index >= len(runes) || runes[index] != '号' {
+		return nil, start, false
+	}
+	return append(digits, '号'), index + 1, true
+}
+
+func compactPageReference(runes []rune, start int) ([]rune, int, bool) {
+	page, end, ok := compactSpacedDigitsBefore(runes, start+1, '页', 6)
+	if !ok {
+		return nil, start, false
+	}
+	index := end
+	for index < len(runes) && isInlineIdentifierSpace(runes[index]) {
+		index++
+	}
+	if index >= len(runes) || runes[index] != '共' {
+		return nil, start, false
+	}
+	total, end, ok := compactSpacedDigitsBefore(runes, index+1, '页', 6)
+	if !ok {
+		return nil, start, false
+	}
+	result := make([]rune, 0, len(page)+len(total)+4)
+	result = append(result, '第')
+	result = append(result, page...)
+	result = append(result, '页', '共')
+	result = append(result, total...)
+	result = append(result, '页')
+	return result, end, true
+}
+
+func compactStateCouncilOrder(runes []rune, start int) ([]rune, int, bool) {
+	prefixEnd := start + len(stateCouncilOrderPrefix)
+	if prefixEnd > len(runes) || !runesEqual(runes[start:prefixEnd], stateCouncilOrderPrefix) {
+		return nil, start, false
+	}
+	digits, end, ok := compactSpacedDigitsBefore(runes, prefixEnd, '号', 6)
+	if !ok {
+		return nil, start, false
+	}
+	result := make([]rune, 0, len(stateCouncilOrderPrefix)+len(digits)+1)
+	result = append(result, stateCouncilOrderPrefix...)
+	result = append(result, digits...)
+	result = append(result, '号')
+	return result, end, true
+}
+
+func compactOrdinalNumber(runes []rune, start int) ([]rune, int, bool) {
+	index := skipOrdinalLayoutWhitespace(runes, start+1)
+	digitStart := index
+	for index < len(runes) && isASCIIDigit(runes[index]) && index-digitStart < 6 {
+		index++
+	}
+	if index == digitStart || index < len(runes) && isASCIIDigit(runes[index]) {
+		return nil, start, false
+	}
+	digitEnd := index
+	index = skipOrdinalLayoutWhitespace(runes, index)
+	if index >= len(runes) || runes[index] != '号' {
+		return nil, start, false
+	}
+	result := make([]rune, 0, digitEnd-digitStart+2)
+	result = append(result, '第')
+	result = append(result, runes[digitStart:digitEnd]...)
+	result = append(result, '号')
+	return result, index + 1, true
+}
+
+func skipOrdinalLayoutWhitespace(runes []rune, index int) int {
+	for index < len(runes) && isInlineIdentifierSpace(runes[index]) {
+		index++
+	}
+	if index < len(runes) && (runes[index] == '\r' || runes[index] == '\n') {
+		if runes[index] == '\r' {
+			index++
+			if index < len(runes) && runes[index] == '\n' {
+				index++
+			}
+		} else {
+			index++
+		}
+		for index < len(runes) && isInlineIdentifierSpace(runes[index]) {
+			index++
+		}
+	}
+	return index
+}
+
+func compactSpacedDigitsBefore(runes []rune, start int, terminator rune, maximum int) ([]rune, int, bool) {
+	index := start
+	for index < len(runes) && isInlineIdentifierSpace(runes[index]) {
+		index++
+	}
+	digits := make([]rune, 0, maximum)
+	for index < len(runes) {
+		if isASCIIDigit(runes[index]) {
+			if len(digits) == maximum {
+				return nil, start, false
+			}
+			digits = append(digits, runes[index])
+			index++
+			continue
+		}
+		if isInlineIdentifierSpace(runes[index]) {
+			for index < len(runes) && isInlineIdentifierSpace(runes[index]) {
+				index++
+			}
+			continue
+		}
+		break
+	}
+	if len(digits) == 0 || index >= len(runes) || runes[index] != terminator {
+		return nil, start, false
+	}
+	return digits, index + 1, true
+}
+
+func compactArticleReference(runes []rune, start int) ([]rune, int, bool) {
+	index := start + 1
+	result := []rune{'第'}
+	dots := 0
+	for components := 0; components < 8; components++ {
+		component, end, ok := compactArticleComponent(runes, index)
+		if !ok {
+			return nil, start, false
+		}
+		result = append(result, component...)
+		index = end
+		for index < len(runes) && isInlineIdentifierSpace(runes[index]) {
+			index++
+		}
+		if index < len(runes) && runes[index] == '.' {
+			dots++
+			result = append(result, '.')
+			index++
+			continue
+		}
+		if index < len(runes) && (runes[index] == '\r' || runes[index] == '\n') {
+			if runes[index] == '\r' {
+				index++
+				if index < len(runes) && runes[index] == '\n' {
+					index++
+				}
+			} else {
+				index++
+			}
+			for index < len(runes) && isInlineIdentifierSpace(runes[index]) {
+				index++
+			}
+		}
+		if dots == 0 || index >= len(runes) || runes[index] != '条' {
+			return nil, start, false
+		}
+		return append(result, '条'), index + 1, true
+	}
+	return nil, start, false
+}
+
+func compactArticleComponent(runes []rune, start int) ([]rune, int, bool) {
+	index := start
+	for index < len(runes) && isInlineIdentifierSpace(runes[index]) {
+		index++
+	}
+	digits := make([]rune, 0, 4)
+	for index < len(runes) {
+		if isASCIIDigit(runes[index]) {
+			if len(digits) == 4 {
+				return nil, start, false
+			}
+			digits = append(digits, runes[index])
+			index++
+			continue
+		}
+		if isInlineIdentifierSpace(runes[index]) {
+			for index < len(runes) && isInlineIdentifierSpace(runes[index]) {
+				index++
+			}
+			continue
+		}
+		break
+	}
+	if len(digits) == 0 {
+		return nil, start, false
+	}
+	return digits, index, true
+}
+
+func identifierTokenRune(value rune, kind identifierFieldKind) (rune, bool) {
+	if isASCIIDigit(value) {
+		return value, true
+	}
+	if kind == identifierAnnouncementCode {
+		if value >= 'A' && value <= 'Z' || value >= 'a' && value <= 'z' || value == '/' {
+			return value, true
+		}
+		if strings.ContainsRune("-－–—", value) {
+			return '-', true
+		}
+	}
+	return 0, false
+}
+
+func validAnnouncementCode(token []rune) bool {
+	if len(token) < 4 || token[0] == '-' || token[len(token)-1] == '-' {
+		return false
+	}
+	alphanumeric := 0
+	for _, value := range token {
+		if isASCIIDigit(value) || value >= 'A' && value <= 'Z' || value >= 'a' && value <= 'z' {
+			alphanumeric++
+		}
+	}
+	return alphanumeric >= 4
+}
+
+func allASCIIDigits(values []rune) bool {
+	for _, value := range values {
+		if !isASCIIDigit(value) {
+			return false
+		}
+	}
+	return true
+}
+
+func isSecuritiesNamePrefixRune(value rune) bool {
+	return value == '*' || value >= 'A' && value <= 'Z' || value >= 'a' && value <= 'z'
+}
+
+func isInlineIdentifierSpace(value rune) bool {
+	return value == ' ' || value == '\u00a0' || value == '\u3000'
+}
+
+func runesEqual(left, right []rune) bool {
+	if len(left) != len(right) {
+		return false
+	}
+	for index := range left {
+		if left[index] != right[index] {
+			return false
+		}
+	}
+	return true
 }
 
 func normalizeChineseSpaces(s string) string {
@@ -465,9 +974,10 @@ func markSpacedChineseDateComponentWhitespace(runes []rune, preserveTSVRows bool
 			start++
 			continue
 		}
-		var digits [2]rune
+		var digits [4]rune
 		digitCount := 0
 		var whitespace []int
+		inlineWhitespaceOnly := true
 		end := start
 		for end < len(runes) {
 			switch {
@@ -479,6 +989,9 @@ func markSpacedChineseDateComponentWhitespace(runes []rune, preserveTSVRows bool
 			case isDateComponentWhitespace(runes[end]):
 				if preserveTSVRows && (runes[end] == '\r' || runes[end] == '\n') && isTSVRowBreak(runes, end) {
 					goto validate
+				}
+				if !isInlineIdentifierSpace(runes[end]) {
+					inlineWhitespaceOnly = false
 				}
 				whitespace = append(whitespace, end)
 			default:
@@ -492,16 +1005,44 @@ func markSpacedChineseDateComponentWhitespace(runes []rune, preserveTSVRows bool
 			for i := 0; i < digitCount; i++ {
 				value = value*10 + int(digits[i]-'0')
 			}
-			valid := runes[end] == '月' && value >= 1 && value <= 12 ||
-				runes[end] == '日' && value >= 1 && value <= 31
+			validDate := digitCount <= 2 && (runes[end] == '月' && value >= 1 && value <= 12 ||
+				runes[end] == '日' && value >= 1 && value <= 31)
+			var suffixWhitespace []int
+			validWorkday := false
+			if inlineWhitespaceOnly && runes[end] == '个' {
+				suffixWhitespace, validWorkday = matchSpacedWorkdaySuffix(runes, end+1, preserveTSVRows)
+			}
+			valid := validDate || validWorkday
 			if valid {
 				for _, index := range whitespace {
+					remove[index] = true
+				}
+				for _, index := range suffixWhitespace {
 					remove[index] = true
 				}
 			}
 		}
 		start = end
 	}
+}
+
+func matchSpacedWorkdaySuffix(runes []rune, start int, preserveTSVRows bool) ([]int, bool) {
+	index := start
+	var whitespace []int
+	for _, expected := range workdaySuffix {
+		for index < len(runes) && isDateComponentWhitespace(runes[index]) {
+			if preserveTSVRows && (runes[index] == '\r' || runes[index] == '\n') && isTSVRowBreak(runes, index) {
+				return nil, false
+			}
+			whitespace = append(whitespace, index)
+			index++
+		}
+		if index >= len(runes) || runes[index] != expected {
+			return nil, false
+		}
+		index++
+	}
+	return whitespace, true
 }
 
 func isChineseDateBoundary(left, right rune) bool {
